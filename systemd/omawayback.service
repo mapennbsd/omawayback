@@ -1,0 +1,10 @@
+# omawayback: one capture of this host's config (user unit).
+# Install: copy to ~/.config/systemd/user/, enable omawayback.timer.
+[Unit]
+Description=Record this host's configuration with omawayback
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omawayback
+Nice=10
+IOSchedulingClass=idle
