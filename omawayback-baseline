@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# omawayback-baseline - record the machine as Omarchy installed it. Run once.
+#
+# Omarchy's installer keeps a read-only btrfs snapshot of the freshly
+# installed system, @factory: the one omarchy-system-factory-reset goes
+# back to. This mounts it read-only and writes what omawayback compares
+# the running machine against: the packages, the enabled services, and
+# /etc as installed. omawayback picks it up at its next capture.
+#
+#   sudo omawayback-baseline
+#
+# It writes only /var/lib/omawayback/factory. Only what anyone could read
+# on the installed system goes there (a file's checksum or content needs
+# it readable by all, under directories all may enter), so it hands no one
+# anything new.
+set -euo pipefail
+umask 022
+export LC_ALL=C
+
+prog=omawayback-baseline
+version=1
+out=/var/lib/omawayback/factory
+from=""
+
+die() { printf '%s: %s\n' "$prog" "$1" >&2; shift; for l in "$@"; do printf '%*s%s\n' $(( ${#prog} + 2 )) '' "$l" >&2; done; exit 1; }
+
+usage() {
+    cat <<EOF
+usage: sudo $prog            record @factory in $out
+       $prog --from DIR      record an installed root already mounted at DIR
+       $prog --out DIR       write somewhere else (tests)
+EOF
+}
+
+while (( $# )); do
+    case $1 in
+        --from) from=${2:?}; shift 2 ;;
+        --out) out=${2:?}; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+
+# The same rule omawayback uses for /etc: generated files and churn, never
+# recorded. Keep the two copies identical (a test compares them).
+etc_skip() {  # path under /etc, without the /etc/: generated files and churn
+    case $1 in
+        ssl/certs/*|ca-certificates/extracted/*|pacman.d/gnupg/*|fonts/conf.d/*|\
+        ld.so.cache|.updated|.pwd.lock|*-|skel/*) return 0 ;;
+    esac
+    return 1
+}
+
+created=-
+if [[ -z $from ]]; then
+    (( EUID == 0 )) || die "run as root: sudo $prog"
+    read -r src fstype < <(findmnt -no SOURCE,FSTYPE /)
+    [[ $fstype == btrfs ]] || die "/ is not btrfs, so there is no @factory snapshot here"
+    dev=${src%%\[*}
+    mnt=$(mktemp -d /run/omawayback-baseline.XXXXXX)
+    trap 'umount "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true' EXIT
+    mount -o ro,subvol=/@factory "$dev" "$mnt" 2>/dev/null ||
+        die "no @factory snapshot on $dev" \
+            "Omarchy's installer takes one; a machine upgraded from an older Omarchy has none"
+    created=$(btrfs subvolume show "$mnt" 2>/dev/null |
+        sed -n 's/^[[:space:]]*Creation time:[[:space:]]*\([0-9-]* [0-9]*:[0-9]*\).*/\1/p')
+    from=$mnt
+fi
+[[ -d $from/etc ]] || die "$from has no /etc"
+
+mkdir -p "${out%/*}"
+new=$(mktemp -d "${out%/*}/.factory.XXXXXX")
+trap 'rm -rf "$new"; umount "${mnt:-/nonexistent}" 2>/dev/null || true; rmdir "${mnt:-/nonexistent}" 2>/dev/null || true' EXIT
+chmod 755 "$new"
+
+db=$from/var/lib/pacman
+v=$(pacman --dbpath "$db" -Q omarchy 2>/dev/null | cut -d' ' -f2) || true
+# pacman may print paths under the root it was given
+strip() { sed "s|$from/etc/|/etc/|g"; }
+{
+    echo "omarchy-version ${v:-$(cat "$from/usr/share/omarchy/version" 2>/dev/null || echo -)}"
+    echo "created ${created:--}"
+    echo "recorded $(date '+%F %H:%M') by $prog $version"
+} >"$new/info.txt"
+pacman --dbpath "$db" -Q >"$new/pacman.txt" 2>/dev/null || true
+pacman --dbpath "$db" -Qqe >"$new/pacman-explicit.txt" 2>/dev/null || true
+systemctl --root="$from" list-unit-files --no-legend --no-pager \
+    --state=enabled,enabled-runtime,linked,masked 2>/dev/null |
+    awk '{print $2, $1}' | sort >"$new/units-system.txt" || true
+systemctl --root="$from" --global list-unit-files --no-legend --no-pager \
+    --state=enabled,enabled-runtime,linked,masked 2>/dev/null |
+    awk '{print $2, $1}' | sort >"$new/units-global.txt" || true
+
+# /etc: "SHA<tab>PATH" for every file ("-" when not readable by all,
+# link:TARGET for a symlink), and a copy of each one no package owns or
+# that differs from its package's copy, as omawayback records the live ones
+pacman --root "$from" --dbpath "$db" -Qlq 2>/dev/null | strip | grep '^/etc/' | sort -u >"$new/.owned" || true
+pacman --root "$from" --dbpath "$db" -Qii 2>/dev/null | strip |
+    grep -oE '/etc/[^ ]+ \[modified\]' | cut -d' ' -f1 | sort -u >"$new/.modified" || true
+declare -A owned=() modified=()
+while IFS= read -r p; do owned[$p]=1; done <"$new/.owned"
+while IFS= read -r p; do modified[$p]=1; done <"$new/.modified"
+rm -f "$new/.owned" "$new/.modified"
+
+# every file first, then one checksum run over those readable by all
+declare -A sum=()
+rels=() readable=()
+while IFS=$'\t' read -r -d '' rel kind perm target; do
+    etc_skip "$rel" && continue
+    rels+=("$rel")
+    if [[ $kind == l ]]; then sum[$rel]=link:$target
+    elif (( 8#$perm & 4 )); then readable+=("$rel")
+    else sum[$rel]=-; fi
+done < <(cd "$from/etc" && find . -type d ! -perm -o=rx -prune -o \( -type f -o -type l \) \
+             -printf '%P\t%y\t%m\t%l\0' 2>/dev/null)
+if (( ${#readable[@]} )); then
+    while IFS= read -r -d '' line; do
+        sum[${line#*  }]=${line%%  *}
+    done < <(cd "$from/etc" && printf '%s\0' "${readable[@]}" | xargs -0 sha256sum -z --)
+fi
+files=0 kept=0
+for rel in "${rels[@]}"; do
+    p=/etc/$rel
+    printf '%s\t%s\n' "${sum[$rel]:--}" "$p"
+    files=$((files + 1))
+    [[ ${sum[$rel]:--} == - ]] && continue
+    if [[ -z ${owned[$p]:-} || -n ${modified[$p]:-} ]]; then
+        mkdir -p "$new/etc/$(dirname "$rel")"
+        cp -P --preserve=mode,timestamps "$from/etc/$rel" "$new/etc/$rel"
+        kept=$((kept + 1))
+    fi
+done | sort -t $'\t' -k2 >"$new/etc.txt"
+files=$(wc -l <"$new/etc.txt")
+kept=$(cd "$new" && find etc \( -type f -o -type l \) 2>/dev/null | wc -l)
+chmod -R a+rX "$new"
+
+rm -rf "$out.old"
+[[ -e $out ]] && mv "$out" "$out.old"
+mv "$new" "$out"
+rm -rf "$out.old"
+trap 'umount "${mnt:-/nonexistent}" 2>/dev/null || true; rmdir "${mnt:-/nonexistent}" 2>/dev/null || true' EXIT
+
+v=$(sed -n 's/^omarchy-version //p' "$out/info.txt")
+printf '%s: recorded Omarchy %s as installed%s\n' "$prog" "$v" "$([[ $created != - ]] && echo " ($created)")"
+printf '%*s%s packages, %s services, %s /etc files (%s kept whole) in %s\n' $(( ${#prog} + 2 )) '' \
+    "$(wc -l <"$out/pacman.txt")" "$(wc -l <"$out/units-system.txt")" "$files" "$kept" "$out"
+printf '%*s%s\n' $(( ${#prog} + 2 )) '' "omawayback reads it at its next capture"
