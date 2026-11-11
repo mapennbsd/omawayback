@@ -180,7 +180,7 @@ check "restore -n shows the diff" grep -q '^-bad' <<<"$out"
 check "restore -n lists what changed later" grep -q '1 file(s) changed after .*' <<<"$out"
 check "restore -n changes nothing" test "$(cat "$cfg/r.conf")" = bad
 out=$(J restore "$good" "$cfg/r.conf"); rc=$?
-check "changed later, no terminal: refused" bash -c 'test "$2" != 0 && grep -q "r.conf *last changed" <<<"$0" && grep -q "run again with -y" <<<"$0" && test "$(cat "$1")" = bad' "$out" "$cfg/r.conf" "$rc"
+check "changed later, no terminal: refused" bash -c 'test "$2" != 0 && grep -q "r.conf *last changed" <<<"$0" && grep -q "run it again with -y" <<<"$0" && grep -q "or with -s" <<<"$0" && test "$(cat "$1")" = bad' "$out" "$cfg/r.conf" "$rc"
 out=$(J restore -s "$good" "$cfg/r.conf")
 check "-s leaves it as it is" bash -c 'grep -q "left ~/.config/app/r.conf as it is" <<<"$0" && test "$(cat "$1")" = bad' "$out" "$cfg/r.conf"
 check "-s with nothing else to do records nothing" test "$(commits)" = "$n0"
@@ -198,8 +198,11 @@ check "dir: newer file left in place" test -f "$cfg/dir/new"
 check "dir: newer file reported" grep -q '1 paths there are newer' <<<"$out"
 check "restore outside home refused" grep -q 'only inside your home' <<<"$(J restore "$good" "$t/outside/x.conf")"
 check "restore of unknown path refused" grep -q 'is not in capture' <<<"$(J restore "$good" "$cfg/nope")"
-check "restore at time works" grep -q 'restored' <<<"$(J restore @now "$cfg/r.conf")"
-check "the latest capture asks nothing" bash -c '! grep -q "changed after" <<<"$0"' "$(J restore HEAD "$cfg/dir")"
+echo agent >"$cfg/r.conf"
+out=$(J restore HEAD "$cfg/r.conf"); rc=$?
+check "no terminal, no -y: an agent's restore writes nothing" bash -c 'test "$2" != 0 && grep -q "needs the user.s yes" <<<"$0" && grep -q "show them: .*restore -n" <<<"$0" && test "$(cat "$1")" = agent' "$out" "$cfg/r.conf" "$rc"
+check "restore at time works" grep -q 'restored' <<<"$(J restore -y @now "$cfg/r.conf")"
+check "the latest capture asks nothing" bash -c '! grep -q "changed after" <<<"$0"' "$(J restore -y HEAD "$cfg/dir")"
 
 # --- init from a template, in a second fake home
 (
@@ -380,12 +383,14 @@ read -r pass fail <"$t/sub.count"
     out=$("$pw" merge ~/.config/hypr/bindings.lua 2>&1)
     check "merge: clean, shown" bash -c 'grep -q "^merges cleanly" <<<"$0" && grep -qx "  +E" <<<"$0"' "$out"
     check "merge: nothing written without -w" test "$(cat "$HOME/.config/hypr/bindings.lua")" = "$(printf 'a\nB\nc\nd\ne')"
-    "$pw" merge -w hypr/bindings.lua >/dev/null 2>&1
+    out=$("$pw" merge -w hypr/bindings.lua 2>&1 </dev/null); rc=$?
+    check "merge -w, no terminal, no -y: nothing written" bash -c 'test "$2" != 0 && grep -q "merge -w -y hypr/bindings.lua" <<<"$0" && test "$(cat "$1")" = "$(printf "a\nB\nc\nd\ne")"' "$out" "$HOME/.config/hypr/bindings.lua" "$rc"
+    "$pw" merge -w -y hypr/bindings.lua >/dev/null 2>&1 </dev/null
     check "merge -w: both changes" test "$(cat "$HOME/.config/hypr/bindings.lua")" = "$(printf 'a\nB\nc\nd\nE')"
     check "merge -w: recorded" grep -qx "capture $host .*: merge ~/.config/hypr/bindings.lua with Omarchy 1.1" <<<"$("$pw" git log -1 --format=%s)"
     check "merge: nothing left" grep -qx 'no customized config needs a merge' <<<"$("$pw" merge 2>&1)"
     printf 'a\nX\nc\nd\nE\n' >"$O/config/hypr/bindings.lua"
-    out=$("$pw" merge -w hypr/bindings.lua 2>&1); rc=$?
+    out=$("$pw" merge -w -y hypr/bindings.lua 2>&1 </dev/null); rc=$?
     check "merge: conflict refused" bash -c 'grep -q "^1 conflicts" <<<"$0" && test "$1" != 0' "$out" "$rc"
     check "merge: conflict leaves the copy" test "$(cat "$HOME/.config/hypr/bindings.lua")" = "$(printf 'a\nB\nc\nd\nE')"
     echo same-v2 >"$O/config/hypr/same.lua"   # your copy is now Omarchy's old one
