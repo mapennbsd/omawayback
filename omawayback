@@ -1,0 +1,2595 @@
+#!/usr/bin/env bash
+# omawayback - an hourly, hands-off history of a workstation's configuration.
+#
+# A journal, not a desired state. Each capture copies the paths named in
+# the scope file, writes package/unit/tool inventories, and commits what
+# changed. Nothing is approved and nothing is applied automatically; you
+# look back with log/diff/cat and put things back with restore.
+#
+#   ~/.config/omawayback/{scope,config}    what to capture (you edit these)
+#   ~/.local/state/omawayback/journal.git  the history (back this up)
+#   ~/.cache/omawayback/tree               work tree of the last capture
+#
+# Runs as the user, never as root. Linux (GNU find/stat), pacman hosts.
+set -euo pipefail
+umask 077
+export LC_ALL=C
+
+prog=omawayback
+version=0.14.0
+self=$(readlink -f "${BASH_SOURCE[0]}")
+self_dir=${self%/*}
+
+conf_dir=${OMAWAYBACK_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/omawayback}
+state_dir=${OMAWAYBACK_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/omawayback}
+tree=${OMAWAYBACK_TREE:-${XDG_CACHE_HOME:-$HOME/.cache}/omawayback/tree}
+gitdir=$state_dir/journal.git
+host=$(hostname -s)
+# the machine as installed, from Omarchy's @factory (omawayback-baseline)
+factory_dir=${OMAWAYBACK_FACTORY:-/var/lib/omawayback/factory}
+etc_root=${OMAWAYBACK_ETC:-/etc}
+
+# --- output: one "prog: " per message, continuation lines aligned under it
+pad=$(printf '%*s' $(( ${#prog} + 2 )) '')
+msg() {  # line...
+    local first=1 l
+    for l in "$@"; do
+        if (( first )); then printf '%s: %s\n' "$prog" "$l"; first=0
+        else printf '%s%s\n' "$pad" "$l"; fi
+    done
+}
+err() { msg "$@" >&2; }
+die() { err "$@"; exit 1; }
+tilde() { printf '%s\n' "${1/#$HOME/\~}"; }
+
+usage() {
+    cat <<EOF
+usage: $prog [capture] [-n] [-v] [-m LABEL]   record the live config (default)
+       $prog init [TEMPLATE]                 create the journal (templates: $(templates))
+       $prog status                          last capture and any error
+       $prog log [PATH]                      captures, newest first
+       $prog diff [REV] [PATH]               what changed in a capture (default: last)
+       $prog cat REV PATH                    a file as it was at REV
+       $prog cat|diff install PATH           an /etc file as installed, or against it
+       $prog restore [-n|-y|-s] REV PATH...  put files or directories back as at REV
+       $prog show [REV]                      this machine against Omarchy and its install
+       $prog changes                         captures that changed the setup, newest first
+       $prog changes FROM [TO]               the setup changes between two captures
+       $prog replay [REV]                    a script that rebuilds this setup on a fresh Omarchy
+       $prog merge [-w] [FILE [REV]]         merge Omarchy's change to a config you customize
+       $prog hooks [install|remove]          a capture after each update, theme and font change
+       $prog menu [install|remove]           Wayback rows on the Omarchy menu
+       $prog note REV TEXT                   say why a capture happened, after the fact
+       $prog skill [install|remove]          the omawayback skill, for coding agents
+       $prog git ARGS...                     any git command against the journal
+
+  -n  dry run: show what would change, change nothing
+  -v  list the changed paths, not just the count
+  -m  name this capture ("before driver update"); commits even if nothing changed
+
+restore asks first about files a later capture changed (a login refreshed
+since, a config edited since); -y puts them back too, -s leaves them.
+
+REV is a hash from log, anything git takes (HEAD~2), or @TIME for the last
+capture at or before a time: @yesterday, @'2026-11-09 14:00', @'3 hours ago'.
+
+The setup is packages, services, /etc and Omarchy's own settings. To
+compare against the install, run "sudo omawayback-baseline" once.
+
+Scope and config: $(tilde "$conf_dir"). History: $(tilde "$gitdir").
+EOF
+}
+
+templates() {
+    local f out=()
+    for f in "$self_dir"/templates/*; do [[ -f $f ]] && out+=("${f##*/}"); done
+    (( ${#out[@]} )) && printf '%s' "${out[*]}" || printf 'none found'
+}
+
+j() { git --git-dir="$gitdir" --work-tree="$tree" "$@"; }
+
+# --- config: key = value lines in $conf_dir/config
+cfg_host=$host max_mb=50 metrics="" hook="" allow_push=no
+load_config() {
+    local f=$conf_dir/config k v
+    [[ -f $f ]] || return 0
+    while IFS='=' read -r k v; do
+        k=${k//[[:space:]]/}; v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+        [[ -z $k || $k == \#* ]] && continue
+        [[ $v == "~" || $v == "~/"* ]] && v=$HOME${v#\~}
+        case $k in
+            host) cfg_host=$v ;;
+            max_mb) max_mb=$v ;;
+            metrics) metrics=$v ;;
+            hook) hook=$v ;;
+            allow_push) allow_push=$v ;;
+            *) err "config: unknown key $k (ignored)" ;;
+        esac
+    done <"$f"
+}
+
+need_journal() {
+    [[ $(id -u) != 0 ]] || die "run as the user whose home this records, not root"
+    [[ -d $gitdir ]] || die "no journal on $host yet: run '$prog init'"
+    load_config
+    [[ $cfg_host == "$host" ]] ||
+        die "this journal belongs to $cfg_host, not $host"
+}
+
+# path argument -> absolute path, and -> path inside the tree (files/...)
+abs_path() {
+    local p=$1
+    [[ $p == "~" || $p == "~/"* ]] && p=$HOME${p#\~}
+    [[ $p == /* ]] || p=$PWD/$p
+    realpath -sm -- "$p"
+}
+tree_path() { printf 'files%s\n' "$(abs_path "$1")"; }
+top() { printf ':(top)%s\n' "$(tree_path "$1")"; }
+
+# REV: anything git takes, or @TIME for the last capture at or before TIME
+rev() {
+    local r=$1 c
+    if [[ $r == @* && $r != @\{* && $r != @ ]]; then
+        c=$(j rev-list -1 --before="${r#@}" HEAD 2>/dev/null || true)
+        [[ -n $c ]] || die "no capture at or before ${r#@}"
+        r=$c
+    fi
+    j rev-parse -q --verify "$r^{commit}" >/dev/null || die "no such capture: $r"
+    printf '%s\n' "$r"
+}
+
+# ------------------------------------------------- reporting (status, metrics, hook)
+# The status file lives outside the tree, so an idle host makes no commits.
+last_ok=""
+write_status() {  # result text
+    mkdir -p "$state_dir"
+    local now; now=$(date +%s)
+    last_ok=$(sed -n 's/^last_ok=//p' "$state_dir/status" 2>/dev/null || true)
+    [[ $1 == failed ]] || last_ok=$now
+    printf 'last_run=%s\nlast_ok=%s\nresult=%s\ntext=%s\n' \
+        "$now" "$last_ok" "$1" "$2" >"$state_dir/status.tmp"
+    mv "$state_dir/status.tmp" "$state_dir/status"
+}
+
+# Prometheus textfile-collector metrics, when `metrics` names a directory
+write_metrics() {  # result changed
+    [[ -n $metrics ]] || return 0
+    [[ -d $metrics && -w $metrics ]] || { err "metrics: $metrics is not a writable directory"; return 0; }
+    local tmp; tmp=$(mktemp "$metrics/.omawayback.XXXXXX")
+    {
+        echo "# HELP omawayback_last_run_timestamp_seconds When the last capture finished."
+        echo "# TYPE omawayback_last_run_timestamp_seconds gauge"
+        echo "omawayback_last_run_timestamp_seconds $(date +%s)"
+        echo "# HELP omawayback_last_success_timestamp_seconds When the last capture succeeded."
+        echo "# TYPE omawayback_last_success_timestamp_seconds gauge"
+        echo "omawayback_last_success_timestamp_seconds ${last_ok:-0}"
+        echo "# HELP omawayback_last_run_success 1 if the last capture succeeded, 0 if it failed."
+        echo "# TYPE omawayback_last_run_success gauge"
+        echo "omawayback_last_run_success $([[ $1 == failed ]] && echo 0 || echo 1)"
+        echo "# HELP omawayback_last_changed_paths Paths the last capture changed."
+        echo "# TYPE omawayback_last_changed_paths gauge"
+        echo "omawayback_last_changed_paths $2"
+    } >"$tmp"
+    chmod 644 "$tmp"
+    mv "$tmp" "$metrics/omawayback.prom"
+}
+
+# The hook: any command, run after every capture with the outcome in the
+# environment. Site-specific monitoring belongs here, not in omawayback.
+run_hook() {  # result message changed commit
+    [[ -n $hook ]] || return 0
+    local rc=0
+    OMAWAYBACK_RESULT=$1 OMAWAYBACK_MESSAGE=$2 OMAWAYBACK_CHANGED=$3 OMAWAYBACK_COMMIT=$4 \
+    OMAWAYBACK_LAST_SUCCESS=${last_ok:-} OMAWAYBACK_HOST=$host OMAWAYBACK_JOURNAL=$gitdir \
+        timeout 60 sh -c "$hook" </dev/null || rc=$?
+    (( rc == 0 )) || err "hook failed (exit $rc): $hook"
+}
+
+report() {  # result message changed commit
+    if [[ $1 == skipped ]]; then
+        last_ok=$(sed -n 's/^last_ok=//p' "$state_dir/status" 2>/dev/null || true)
+    else
+        write_status "$1" "$2"
+        write_metrics "$1" "$3"
+    fi
+    run_hook "$@"
+}
+
+# ---------------------------------------------------------------- scope
+# scope file lines:
+#   PATH       capture this file or directory (~ = home); missing is fine
+#   - PATTERN  never capture (rsync pattern; leading ~ or / anchors it)
+#   @etc       also capture every /etc file pacman reports modified, and
+#              every /etc file no package owns (minus known noise)
+roots=() excludes=() want_etc=0
+read_scope() {
+    local f=$conf_dir/scope line
+    [[ -f $f ]] || die "no scope file: $(tilde "$f")"
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%%#*}
+        line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
+        [[ -z $line ]] && continue
+        case $line in
+            @etc) want_etc=1 ;;
+            '- '*) line=${line#- }
+                   [[ $line == "~" || $line == "~/"* ]] && line=$HOME${line#\~}
+                   excludes+=("$line") ;;
+            '~'|'~/'*) roots+=("$HOME${line#\~}") ;;
+            /*) roots+=("$line") ;;
+            *) err "scope: not a path or pattern, skipped: $line" ;;
+        esac
+    done <"$f"
+}
+
+# Noise only: nothing is left out by name for being a key, token or login.
+# What a capture records is what the scope names (and what this account can
+# read); the scope's own "- PATTERN" lines keep anything else out.
+builtin_excludes=(
+    .git node_modules/ __pycache__/ '*.sock' '*.pid' '*.log' '*.swp'
+    /etc/ssl/certs/ /etc/ca-certificates/extracted/ /etc/pacman.d/gnupg/
+    /etc/fonts/conf.d/ /etc/ld.so.cache /etc/.updated /etc/.pwd.lock
+    '/etc/*-'
+    /home/*/.local/state/omarchy/current/theme.generation
+    /home/*/.local/state/omarchy/current/next-theme/
+)
+
+# /etc files worth recording without listing them: modified package
+# backup files, and files no package owns. Unreadable ones are reported.
+etc_auto=() etc_unreadable=()
+etc_excluded() {  # path: matches a builtin /etc exclude
+    local p
+    for p in "${builtin_excludes[@]}"; do
+        [[ $p == /etc/* ]] || continue
+        if [[ $p == */ ]]; then [[ $1 == "$p"* ]] && return 0
+        else [[ $1 == $p ]] && return 0; fi
+    done
+    return 1
+}
+discover_etc() {
+    local f state
+    while read -r f state; do
+        etc_excluded "$f" && continue
+        case $state in
+            '[modified]') etc_auto+=("$f") ;;
+            '[unreadable]') etc_unreadable+=("$f") ;;
+        esac
+    done < <(pacman -Qii 2>/dev/null | grep -oE '/etc/[^ ]+ \[(modified|unreadable)\]' | sort -u)
+    while read -r f; do
+        etc_excluded "$f" && continue
+        if [[ -r $f || -L $f ]]; then etc_auto+=("$f"); else etc_unreadable+=("$f"); fi
+    done < <(comm -23 \
+        <(find /etc \( -type f -o -type l \) 2>/dev/null | sort) \
+        <(pacman -Qlq 2>/dev/null | grep '^/etc/' | sort -u))
+}
+
+# rsync filter rules: excludes first, then each root and its parents, then
+# exclude everything else. With --delete-excluded the tree ends up holding
+# exactly the scope, so a path dropped from the scope leaves the journal.
+esc() { sed 's/[][*?\\]/\\&/g' <<<"$1"; }
+build_filter() {  # out-file
+    local out=$1 p d r
+    declare -A seen=()
+    {
+        for p in "${builtin_excludes[@]}" "${excludes[@]}"; do printf -- '- %s\n' "$p"; done
+        # unreadable/oversized: hide from the sender, protect the old copy,
+        # so a failed read keeps the last good version instead of a deletion
+        for p in "${skip_paths[@]}"; do
+            d=$(esc "$p")$([[ -d $p && ! -L $p ]] && echo /)
+            printf 'H %s\nP %s\n' "$d" "$d"
+        done
+        for r in "${live_roots[@]}"; do
+            d=${r%/*}
+            while [[ -n $d && -z ${seen[$d]:-} ]]; do
+                seen[$d]=1; printf -- '+ %s/\n' "$(esc "$d")"; d=${d%/*}
+            done
+            if [[ -d $r && ! -L $r ]]; then printf -- '+ %s/***\n' "$(esc "$r")"
+            else printf -- '+ %s\n' "$(esc "$r")"; fi
+        done
+        echo '- *'
+    } >"$out"
+}
+
+# ------------------------------------------------------------ inventories
+inventories() {  # dir
+    local d=$1 n
+    mkdir -p "$d"
+    pacman -Q >"$d/pacman.txt"
+    pacman -Qqe >"$d/pacman-explicit.txt"
+    pacman -Qqm >"$d/pacman-foreign.txt" || true
+    systemctl list-unit-files --no-legend --no-pager \
+        --state=enabled,enabled-runtime,linked,masked 2>/dev/null |
+        awk '{print $2, $1}' | sort >"$d/units-system.txt" || true
+    systemctl --user list-unit-files --no-legend --no-pager \
+        --state=enabled,enabled-runtime,linked,masked 2>/dev/null |
+        awk '{print $2, $1}' | sort >"$d/units-user.txt" || true
+
+    # mise: from $HOME so a project's config never leaks in; never installs
+    if command -v mise >/dev/null; then
+        (cd "$HOME" && MISE_OFFLINE=1 timeout 60 mise ls --json 2>/dev/null) |
+            jq -S 'with_entries(.value |= map({version, requested_version,
+                installed, active, source: .source.path}))' \
+            >"$d/mise.json" 2>/dev/null || rm -f "$d/mise.json"
+    fi
+
+    # npm globals: each real node prefix once (aliases like 26 -> 26.13.0)
+    {
+        local prefix pj
+        for prefix in "$HOME"/.local/share/mise/installs/node/* /usr; do
+            [[ -d $prefix/lib/node_modules ]] || continue
+            readlink -f "$prefix"
+        done | sort -u | while read -r prefix; do
+            for pj in "$prefix"/lib/node_modules/*/package.json \
+                      "$prefix"/lib/node_modules/@*/*/package.json; do
+                [[ -f $pj ]] || continue
+                printf '%s %s\n' "$(tilde "$prefix")" \
+                    "$(jq -r '.name + "@" + .version' "$pj" 2>/dev/null)"
+            done
+        done
+    } >"$d/npm-global.txt"
+
+    # uv tools, only from a real binary (a mise shim could try to install).
+    # The timer's PATH is only /usr/local/bin:/usr/bin, so ask mise for a uv
+    # it installed, or the timer and a shell would record different things.
+    n=$(command -v uv || true)
+    if [[ ( -z $n || $n == */mise/shims/* ) ]] && command -v mise >/dev/null; then
+        n=$(cd "$HOME" && MISE_OFFLINE=1 timeout 20 mise which uv 2>/dev/null) || n=""
+    fi
+    if [[ -n $n && -x $n && $n != */mise/shims/* ]]; then
+        (cd "$HOME" && timeout 30 "$n" tool list 2>/dev/null) >"$d/uv-tools.txt" || true
+    fi
+    if command -v flatpak >/dev/null; then
+        flatpak list --app --columns=application,version,origin 2>/dev/null |
+            sort >"$d/flatpak.txt" || true
+    fi
+
+    if is_omarchy; then om_profile "$d/omarchy"; fi
+}
+
+# ------------------------------------------------------------ Omarchy profile
+# The machine as Omarchy sees it, beside the files: settings, packages
+# relative to Omarchy's defaults, themes, plugins, apps, toggles, hooks, the
+# shipped configs you customize, migrations and health. Read-only by rule:
+# files and commands that only print. Never a setter, never omarchy-debug
+# (it uploads). Anything not found reads "-"; Omarchy changes shape.
+export OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
+om_state=$HOME/.local/state/omarchy
+om_conf=$HOME/.config/omarchy
+is_omarchy() { [[ -d $OMARCHY_PATH/config ]] && command -v omarchy-version >/dev/null; }
+
+# first line a getter prints, or "-": bounded, no stdin, errors dropped
+og() { local v; v=$(timeout 10 "$@" </dev/null 2>/dev/null | head -1) || true; printf '%s\n' "${v:--}"; }
+first_line() { local v=""; if [[ -f $1 ]]; then read -r v <"$1" || true; fi; printf '%s\n' "${v:--}"; }
+pkg_names() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$@" 2>/dev/null || true; }
+
+# where a git theme or plugin came from
+dir_source() {
+    if [[ -L $1 ]]; then echo "link $(tilde "$(readlink -f "$1")")"
+    elif [[ -e $1/.git ]]; then
+        echo "git $(git -C "$1" remote get-url origin 2>/dev/null || echo -)" \
+             "$(git -C "$1" rev-parse --short=12 HEAD 2>/dev/null || echo -)"
+    else echo local; fi
+}
+
+om_profile() {  # dir
+    local d=$1 f n
+    mkdir -p "$d"
+    # the session's view, also when run from ssh or a bare timer
+    local XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-Hyprland}
+    export XDG_CURRENT_DESKTOP
+
+    # settings: one "key value" line each, for diffs and a rebuild
+    {
+        local cur=$om_state/current
+        echo "version $(og omarchy-version)"
+        echo "channel $(og omarchy-version-channel)"
+        echo "platform $(og omarchy-hw-platform)"
+        echo "theme $(first_line "$cur/theme.name")"
+        echo "font $(og omarchy-font-current)"
+        if [[ -L $cur/background ]]; then
+            echo "background $(tilde "$(readlink "$cur/background")")"
+            if [[ -f $cur/background ]]; then
+                echo "background-sha256 $(sha256sum <"$cur/background" | cut -d' ' -f1)"
+            fi
+        fi
+        echo "browser $(og omarchy-cmd-default-browser)"
+        n=$(og xdg-terminal-exec --print-id); echo "terminal ${n%%:*}"
+        echo "editor $(first_line "$om_state/defaults/editor")"
+        echo "agent $(first_line "$om_conf/defaults/agent")"
+        echo "dictation $(first_line "$om_conf/defaults/dictation")"
+        echo "preinstalls $([[ -e $om_state/preinstalls-removed ]] && echo removed || echo kept)"
+    } >"$d/settings.txt"
+
+    om_packages >"$d/packages.txt"
+
+    # themes and plugins you added, and where each came from
+    for f in "$om_conf"/themes/*; do
+        [[ -d $f ]] && echo "${f##*/} $(dir_source "$f")"
+    done >"$d/themes.txt"
+    {
+        local id bar
+        for f in "$om_conf"/plugins/*; do
+            [[ -f $f/manifest.json ]] || continue
+            id=$(jq -r '.id // empty' "$f/manifest.json" 2>/dev/null || true)
+            bar=$(jq -r --arg id "${id:-${f##*/}}" '[.bar.layout // {} | to_entries[]
+                | select(any(.value[]?; .id? == $id)) | .key] | join(",")' \
+                "$om_conf/shell.json" 2>/dev/null || true)
+            echo "${id:-${f##*/}} bar=${bar:--} $(dir_source "$f")"
+        done
+    } >"$d/plugins.txt"
+
+    # web apps and TUIs by the tests Omarchy's own remove-all uses
+    {
+        local app=$HOME/.local/share/applications e kind origin
+        for f in "$app"/*.desktop; do
+            [[ -f $f ]] || continue
+            e=$(sed -n 's/^Exec=//p' "$f" | head -1)
+            case $e in
+                omarchy-launch-webapp*|omarchy-webapp-handler*) kind=webapp ;;
+                "xdg-terminal-exec --app-id=TUI."*) kind=tui ;;
+                *) continue ;;
+            esac
+            n=$OMARCHY_PATH/applications/${f##*/}
+            if [[ ! -f $n ]]; then origin=yours
+            elif cmp -s "$f" "$n"; then origin=shipped
+            else origin=shipped-modified; fi
+            n=${f##*/}; echo "$kind $origin ${n%.desktop}"
+        done
+        for f in "$OMARCHY_PATH"/applications/*.desktop; do
+            n=${f##*/}
+            [[ -e $app/$n ]] || echo "removed shipped ${n%.desktop}"
+        done
+    } >"$d/apps.txt"
+
+    {
+        local t=$om_state/toggles
+        if [[ -d $t ]]; then
+            find "$t" -maxdepth 1 -type f -printf 'flag %f\n'
+            for f in "$t"/hypr/*.lua; do
+                n=${f##*/}; n=${n%.lua}
+                [[ -f $f && $n != flags ]] && echo "hypr $n"
+            done
+        fi
+    } | sort >"$d/toggles.txt"
+
+    # hooks Omarchy will run (samples are Omarchy's; it skips them)
+    for f in "$om_conf"/hooks/* "$om_conf"/hooks/*.d/*; do
+        [[ -f $f && $f != *.sample ]] && echo "${f#"$om_conf"/hooks/}"
+    done | sort >"$d/hooks.txt"
+
+    # shipped configs (not hook samples, which never run): same as Omarchy's,
+    # customized, or absent, with the shipped version's hash; a copy of the shipped file for each customized
+    # one, the base for a three-way merge when Omarchy changes it
+    {
+        local base=$OMARCHY_PATH/config rel live st
+        (cd "$base" && find . \( -type f -o -type l \) ! -name '*.sample' -printf '%P\n') | sort |
+        while IFS= read -r rel; do
+            live=$HOME/.config/$rel
+            if [[ ! -e $live ]]; then st=absent
+            elif cmp -s "$base/$rel" "$live"; then st=same
+            else
+                st=custom
+                mkdir -p "$(dirname "$d/shipped/$rel")"
+                cp "$base/$rel" "$d/shipped/$rel"
+            fi
+            echo "$st $(sha256sum <"$base/$rel" | cut -c1-12) $rel"
+        done
+    } >"$d/configs.txt"
+
+    # migrations run here, with what each did (its first echo)
+    {
+        local id desc
+        for f in "$om_state"/migrations/*.sh; do
+            [[ -f $f ]] || continue
+            id=${f##*/}; id=${id%.sh}
+            desc=$(sed -n '1,5s/^echo "\(.*\)"$/\1/p' "$OMARCHY_PATH/migrations/$id.sh" 2>/dev/null | head -1)
+            echo "$id ${desc:--}"
+        done
+    } >"$d/migrations.txt"
+
+    om_health >"$d/health.txt"
+    if [[ -f $tree/factory/info.txt ]]; then om_install "$d"; fi
+    return 0
+}
+
+# ------------------------------------------------- the machine as installed
+# Against the record of @factory that omawayback-baseline writes: packages,
+# services and /etc since the install, each with whose change it most
+# likely is. Read from the files, not guessed from times: Omarchy's when
+# the content is a file Omarchy ships, or Omarchy's install scripts and
+# migrations name the path or turn the unit on or off; a package's when
+# pacman owns the file and it is as the package left it; the system's for
+# accounts, identity and boot; yours otherwise.
+
+# The same rule omawayback-baseline uses: generated files and churn, never
+# recorded. Keep the two copies identical (a test compares them).
+etc_skip() {  # path under /etc, without the /etc/: generated files and churn
+    case $1 in
+        ssl/certs/*|ca-certificates/extracted/*|pacman.d/gnupg/*|fonts/conf.d/*|\
+        ld.so.cache|.updated|.pwd.lock|*-|skel/*) return 0 ;;
+    esac
+    return 1
+}
+
+# "SUM<tab>/etc/REL" for each file under ROOT as omawayback-baseline records
+# them: a checksum only for files anyone may read, under directories anyone
+# may enter; "-" for the rest; link:TARGET for a symlink
+etc_scan() {  # root
+    local rel kind perm target line
+    local -A sum=()
+    local -a rels=() readable=()
+    while IFS=$'\t' read -r -d '' rel kind perm target; do
+        etc_skip "$rel" && continue
+        rels+=("$rel")
+        if [[ $kind == l ]]; then sum[$rel]=link:$target
+        elif (( 8#$perm & 4 )); then readable+=("$rel")
+        else sum[$rel]=-; fi
+    done < <(cd "$1" && find . -type d ! -perm -o=rx -prune -o \( -type f -o -type l \) \
+                 -printf '%P\t%y\t%m\t%l\0' 2>/dev/null)
+    if (( ${#readable[@]} )); then
+        while IFS= read -r -d '' line; do
+            sum[${line#*  }]=${line%%  *}
+        done < <(cd "$1" && printf '%s\0' "${readable[@]}" | xargs -0 sha256sum -z -- 2>/dev/null)
+    fi
+    for rel in "${rels[@]}"; do printf '%s\t/etc/%s\n' "${sum[$rel]:--}" "$rel"; done | sort -t $'\t' -k2
+}
+
+# what Omarchy's install scripts and migrations do to units: "on|off
+# system|user UNIT", the last word for each unit last; loops over a list
+# of units ("for unit in a b; do systemctl enable $unit") are followed
+om_unit_intents() {
+    local f
+    find "$OMARCHY_PATH/install" "$OMARCHY_PATH/migrations" -type f -name '*.sh' 2>/dev/null | sort |
+    while IFS= read -r f; do
+        sed -e :a -e '/\\$/N; s/\\\n/ /; ta' "$f" | awk '
+            function emit(v, sc, u) { if (u !~ /\./) u = u ".service"; print (v == "enable" ? "on" : "off"), sc, u }
+            /^[[:space:]]*#/ { next }
+            match($0, /for [A-Za-z_][A-Za-z0-9_]* in [^;]*;/) {
+                n = split(substr($0, RSTART + 4, RLENGTH - 5), w, /[[:space:]]+/)
+                k = w[1]; list[k] = ""
+                for (i = 3; i <= n; i++) if (w[i] != "") list[k] = list[k] " " w[i]
+            }
+            /systemctl/ {
+                s = substr($0, index($0, "systemctl") + 9); sub(/[|;&>].*/, "", s)
+                n = split(s, w, /[[:space:]]+/); sc = "system"; verb = ""
+                for (i = 1; i <= n; i++) {
+                    t = w[i]; gsub(/"/, "", t)
+                    if (t == "") continue
+                    if (t == "--user") { sc = "user"; continue }
+                    if (t ~ /^-/) continue
+                    if (verb == "") { if (t ~ /^(enable|disable|mask)$/) { verb = t; continue }; break }
+                    if (t ~ /^\$\{?[A-Za-z_]/) {
+                        gsub(/[${}]/, "", t); m = split(list[t], u, " ")
+                        for (j = 1; j <= m; j++) emit(verb, sc, u[j])
+                        continue
+                    }
+                    if (t ~ /^[0-9]$/ || t ~ /[^A-Za-z0-9@._:-]/) continue
+                    emit(verb, sc, t)
+                }
+            }'
+    done
+}
+
+om_install() {  # dir
+    local d=$1 f=$tree/factory inv=$tree/inventory t=$work/install
+    mkdir -p "$t"
+    {
+        sed -n 's/^\(omarchy-version\|created\) /&/p' "$f/info.txt"
+    } >"$d/install.txt"
+
+    # packages you asked for that the install did not have, and the ones
+    # it asked for that are gone
+    cut -d' ' -f1 "$f/pacman.txt" | sort -u >"$t/was-all"
+    cut -d' ' -f1 "$inv/pacman.txt" | sort -u >"$t/now-all"
+    # whose: an added package in Omarchy's set now came with Omarchy, a
+    # removed one no longer in it Omarchy dropped or replaced
+    local stock=$work/om/stock
+    [[ -s $stock ]] || stock=/dev/null
+    {
+        sort -u "$inv/pacman-explicit.txt" | comm -23 - "$t/was-all" | sed 's/^/added /'
+        sort -u "$f/pacman-explicit.txt" | comm -23 - "$t/now-all" | sed 's/^/removed /'
+    } | awk 'NR == FNR { s[$1]; next }
+             { in_set = ($2 in s); print $1, $2, (($1 == "added") == in_set ? "omarchy" : "yours") }' \
+        <(cat "$stock"; echo) - >"$d/install-packages.txt"
+
+    # units: "UNIT NOW WAS WHO", system ones against the install's, user
+    # ones against what the install enabled for every user
+    local -A want=() pkg=()
+    local v sc u now was on i n
+    while read -r v sc u; do want[$sc:$u]=$v; done < <(om_unit_intents)
+    while read -r n; do [[ -n $n ]] && pkg[$n]=1; done <"$stock"
+    {
+        # enabled-runtime links are made at each boot, not configuration
+        awk 'NR == FNR { if (NF && $1 != "enabled-runtime") w[$2] = $1; next }
+             $1 == "enabled-runtime" { next }
+             NF { n[$2] = $1; if (!($2 in w)) print $2, $1, "off"; else if (w[$2] != $1) print $2, $1, w[$2] }
+             END { for (u in w) if (!(u in n)) print u, "off", w[u] }' \
+            <(cat "$f/units-system.txt"; echo) <(cat "$inv/units-system.txt" 2>/dev/null; echo) |
+            sed 's/^/system /'
+        awk 'NR == FNR { if (NF) g[$2]; next } NF && !($2 in g) && $1 != "enabled-runtime" { print $2, $1, "off" }' \
+            <(cat "$f/units-global.txt" 2>/dev/null; echo) <(cat "$inv/units-user.txt" 2>/dev/null; echo) |
+            sed 's/^/user /'
+    } | while read -r sc u now was; do
+        on=0; [[ $now == enabled* || $now == linked ]] && on=1
+        i=${want[$sc:$u]:-}
+        # no script names it: a unit turned on that is named for a package
+        # in Omarchy's set (superwhisper, pipewire-pulse) is that package's
+        # setup, which Omarchy ran
+        n=${u%.*}; n=${n%%@*}
+        if [[ $u == omarchy-* || ( $i == on && $on == 1 ) || ( $i == off && $on == 0 ) ]]; then v=omarchy
+        elif [[ -n $i ]]; then v=yours-over
+        elif (( on )) && [[ -n ${pkg[$n]:-}${pkg[$n-bin]:-}${pkg[$n-git]:-} ]]; then v=omarchy
+        else v=yours; fi
+        [[ $sc == user ]] && u=user/$u
+        echo "$u $now $was $v"
+    done | sort >"$d/install-units.txt"
+
+    # /etc: "STATE WHO PATH" for each file added, changed or removed since
+    # the install; enable links are services, above
+    find "$OMARCHY_PATH"/default "$OMARCHY_PATH"/etc-overrides "$OMARCHY_PATH"/config -type f -print0 2>/dev/null |
+        xargs -0r sha256sum 2>/dev/null | cut -d' ' -f1 | sort -u >"$t/om-sums"
+    grep -rhoE '/etc/[A-Za-z0-9._/@+-]+' "$OMARCHY_PATH"/install "$OMARCHY_PATH"/migrations \
+        "$OMARCHY_PATH"/bin 2>/dev/null | sed 's/[.]$//' | sort -u >"$t/om-paths" || true
+    pacman -Ql 2>/dev/null | awk 'index($0, " /etc/")' | sort -u >"$t/owned" || true
+    pacman -Qii 2>/dev/null | grep -oE '/etc/[^ ]+ \[modified\]' | cut -d' ' -f1 | sort -u >"$t/modified" || true
+    etc_scan "$etc_root" >"$t/etc-now"
+    local sys='^/etc/(passwd|group|shells|subuid|subgid|machine-id|hostname|hosts|locale[.]conf|locale[.]gen|localtime|vconsole[.]conf|adjtime|resolv[.]conf|printcap|crypttab|fstab|kernel/cmdline|mkinitcpio[.]conf|mkinitcpio[.]d/.*|default/limine|ssh/ssh_host_.*[.]pub|ld[.]so[.]conf)$'
+    awk -F'\t' -v sys="$sys" -v same="$t/etc-same" '
+        # enable links and unit aliases (dbus-org.bluez.service) are services
+        function skip(p, s) {
+            return p ~ /^\/etc\/systemd\/(system|user)\/[^\/]+[.](wants|requires|upholds)\// ||
+                   (s ~ /^link:/ && p ~ /^\/etc\/systemd\/(system|user)\/[^\/]+$/) ||
+                   (s == "link:/dev/null" && p ~ /^\/etc\/systemd\//) }
+        function who(p, s,   n) {
+            n = p; sub(/.*\//, "", n)
+            if (n ~ /[.]pacnew$/) return "pacnew"
+            if (n ~ /([.]pacsave|[.]bak|[.]back|[.]orig|[.]old|[.]O|~)$/ || n ~ /[.]bak[.]|[.]omarchy-/) return "leftover"
+            if (s in oms) return "omarchy"
+            if ((p in omown) && !(p in mod)) return "omarchy"
+            if ((p in own) && !(p in mod)) return "package"
+            if (p ~ sys) return "system"
+            if ((p in omp) || n ~ /omarchy/) return "omarchy"
+            return "yours" }
+        FILENAME == ARGV[1] { if (NF == 2) was[$2] = $1; next }
+        FILENAME == ARGV[2] { if (NF == 2) now[$2] = $1; next }
+        FILENAME == ARGV[3] { oms[$0]; next }
+        FILENAME == ARGV[4] { omp[$0]; next }
+        FILENAME == ARGV[5] { q = substr($0, index($0, " ") + 1); own[q]; if ($1 ~ /^omarchy/) omown[q]; next }
+        FILENAME == ARGV[6] { mod[$0]; next }
+        END {
+            n = 0
+            for (p in now) {
+                if (skip(p, now[p])) continue
+                if (!(p in was)) print "added " who(p, now[p]) " " p
+                else if (was[p] != now[p] && was[p] != "-" && now[p] != "-") print "changed " who(p, now[p]) " " p
+                else n++
+            }
+            for (p in was) if (!(p in now) && !skip(p, was[p])) print "removed - " p
+            print n > same }' \
+        "$f/etc.txt" "$t/etc-now" "$t/om-sums" "$t/om-paths" "$t/owned" "$t/modified" |
+        sort -k3 >"$t/etc-who"
+    # a file of yours in a directory Omarchy's scripts write, named in them
+    # too (chromium/policies/managed/color.json, written through a variable)
+    local st w path
+    while read -r st w path; do
+        if [[ $w == yours ]] && grep -qxF -- "${path%/*}" "$t/om-paths" &&
+           grep -rqF -- "${path##*/}" "$OMARCHY_PATH"/install "$OMARCHY_PATH"/migrations "$OMARCHY_PATH"/bin 2>/dev/null; then
+            w=omarchy
+        fi
+        echo "$st $w $path"
+    done <"$t/etc-who" >"$d/install-etc.txt"
+    echo "etc-same $(cat "$t/etc-same" 2>/dev/null || echo 0)" >>"$d/install.txt"
+}
+
+# packages relative to Omarchy: "added PKG [via SOURCE]" for what you have
+# beyond Omarchy's set, "dropped PKG" for Omarchy defaults you do not have
+om_packages() {
+    local t=$work/om
+    mkdir -p "$t"
+    omarchy-pkg-defaults 2>/dev/null </dev/null | sort -u >"$t/defaults" || true
+    [[ -s $t/defaults ]] || return 0
+    {
+        cat "$t/defaults"
+        pkg_names "$OMARCHY_PATH/install/omarchy-other.packages"
+        pacman -Qi omarchy 2>/dev/null | awk '
+            /^Depends On/ { f = 1; sub(/^[^:]*: */, ""); print; next }
+            f && /^[^ ]/ { f = 0 } f' | tr -s ' ' '\n' | sed 's/[<>=].*//'
+        echo omarchy
+    } | sed '/^$/d; /^None$/d' | sort -u >"$t/stock"
+    # pacman.log is a record, the scripts only a reading: installer wins
+    om_pkg_sources | awk '{ if ($2 == "installer") i[$1] = 1
+                            else if (!($1 in s)) s[$1] = $2
+                            else if (index("," s[$1] ",", "," $2 ",") == 0) s[$1] = s[$1] "," $2 }
+        END { for (p in i) print p, "installer"; for (p in s) if (!(p in i)) print p, s[p] }' |
+        sort >"$t/sources"
+    pacman -Qqe | sort | comm -23 - "$t/stock" | join -a1 - "$t/sources" |
+        awk '{ print "added " $1 (NF > 1 ? " via " $2 : "") }'
+    # pacman -T resolves provides (nvim is provided by neovim)
+    xargs -a "$t/defaults" pacman -T 2>/dev/null | sed 's/^/dropped /' || true
+}
+
+# PKG SOURCE lines: an omarchy-install-* script, an Omarchy menu entry, or
+# "installer" when the original install named it (pacman.log, -r /mnt)
+om_pkg_sources() {
+    local f n
+    for f in "$OMARCHY_PATH"/bin/omarchy-install-*; do
+        [[ -f $f ]] || continue
+        n=${f##*/}
+        sed -e :a -e '/\\$/N; s/\\\n/ /; ta' "$f" |
+            grep -oE 'omarchy-pkg-(aur-)?add([[:space:]]+[A-Za-z0-9@._+-]+)+' |
+            tr -s ' \t' '\n\n' | grep -vE '^(omarchy-pkg-|-)' | sed "s|\$| $n|" || true
+        # the package picked from a fixed list: omarchy:args=<a|b|c>
+        if grep -qE 'omarchy-pkg-(aur-)?add[[:space:]]+"?\$' "$f"; then
+            sed -n 's/^# omarchy:args=<\([a-z0-9._+-]*\(|[a-z0-9._+-]*\)\{1,\}\)>$/\1/p' "$f" |
+                tr '|' '\n' | sed "s|\$| $n|"
+        fi
+    done
+    f=$OMARCHY_PATH/default/omarchy/omarchy-menu.jsonc
+    if [[ -f $f ]]; then
+        grep -vE '^[[:space:]]*//' "$f" | sed -z 's/,\([[:space:]]*[]}]\)/\1/g' |
+            jq -r 'to_entries[] | select((.value.action? // "") | type == "string"
+                   and test("^omarchy-install-(and-launch|app|font) "))
+                   | [.key, .value.action] | @tsv' 2>/dev/null |
+            while IFS=$'\t' read -r n f; do
+                printf '%s\n' "$f" | xargs -n1 printf '%s\n' 2>/dev/null | sed -n 3p |
+                    tr ' ' '\n' | sed "/^\$/d; s|\$| menu:$n|"
+            done || true
+    fi
+    grep -E "\[PACMAN\] Running 'pacman .*-r /mnt.* -S" /var/log/pacman.log 2>/dev/null |
+        sed "s/.*Running '//; s/'\$//" | tr ' ' '\n' |
+        grep -vE '^(-|/|pacman$)|=|^$' | sed 's/$/ installer/' || true
+}
+
+# health: pending migrations; Hyprland config errors from the running
+# session (kept from the last capture when there is no session to ask)
+om_health() {
+    local f p=0 sig="" errs
+    # by the files, as omarchy-migrate --pending does; never call the
+    # migrator itself, which runs them
+    for f in "$OMARCHY_PATH"/migrations/*.sh; do
+        [[ -f $f && ! -f $om_state/migrations/${f##*/} ]] && p=$((p + 1))
+    done
+    echo "migrations-pending $p"
+    if command -v hyprctl >/dev/null; then
+        sig=${HYPRLAND_INSTANCE_SIGNATURE:-}
+        [[ -n $sig ]] || sig=$(timeout 5 hyprctl -j instances 2>/dev/null </dev/null |
+                               jq -r '.[0].instance // empty' 2>/dev/null || true)
+    fi
+    if [[ -n $sig ]] && errs=$(HYPRLAND_INSTANCE_SIGNATURE=$sig timeout 10 hyprctl -j configerrors \
+                               2>/dev/null </dev/null | jq -r '.[] | select(. != "")' 2>/dev/null); then
+        echo "hyprland-config-errors $(grep -c . <<<"$errs" || true)"
+        [[ -z $errs ]] || sed 's/^/hyprland-config-error /' <<<"$errs"
+    else
+        j show HEAD:inventory/omarchy/health.txt 2>/dev/null | grep '^hyprland-' || true
+    fi
+}
+
+# what changed at Omarchy's level between two profiles: A and B are
+# captures, B empty for the tree being committed. The commit message's
+# Omarchy section; with "packages", also packages beyond Omarchy's set
+# (a commit message has its own package line).
+om_summary() {  # A B [packages]
+    local a=$1 b=$2
+    j cat-file -e "$a:inventory/omarchy/settings.txt" 2>/dev/null || return 0
+    # settings and health: "key old -> new"
+    awk 'NR == FNR { k = $1; sub(/^[^ ]* ?/, ""); o[k] = $0; next }
+         { k = $1; sub(/^[^ ]* ?/, "") }
+         (k in o) && o[k] != $0 && k != "background-sha256" { print "omarchy " k " " o[k] " -> " $0 }' \
+        <(om_at "$a" settings.txt) <(om_at "$b" settings.txt)
+    awk 'NR == FNR { if (NF == 2) o[$1] = $2; next }
+         NF == 2 && ($1 in o) && o[$1] != $2 { k = $1; gsub(/-/, " ", k)
+             print (k ~ /^migrations/ ? "omarchy " : "") k ": " $2 " (was " o[$1] ")" }' \
+        <(om_at "$a" health.txt) <(om_at "$b" health.txt)
+    awk 'NR == FNR { o[$1]; next }
+         !($1 in o) { c++; if (c <= 10) print "omarchy migration " $0 }
+         END { if (c > 10) print "omarchy migrations: " c - 10 " more" }' \
+        <(om_at "$a" migrations.txt) <(om_at "$b" migrations.txt)
+    # shipped configs: Omarchy's version moved under yours, or yours moved
+    awk 'NR == FNR { r = substr($0, length($1 $2) + 3); os[r] = $1; oh[r] = $2; next }
+         { r = substr($0, length($1 $2) + 3); if (!(r in os)) next
+           if ($1 == "custom" && oh[r] != $2) {
+               if (os[r] == "custom") cust = cust ", " r; else kept = kept ", " r }
+           else if ($1 == "custom" && os[r] == "same") mine = mine ", " r
+           else if ($1 == "same" && os[r] == "custom") back = back ", " r }
+         END {
+           if (cust != "") print "omarchy changed defaults you customize: " substr(cust, 3)
+           if (kept != "") print "omarchy changed defaults, your copies are the old ones: " substr(kept, 3)
+           if (mine != "") print "omarchy defaults you now customize: " substr(mine, 3)
+           if (back != "") print "omarchy defaults you no longer customize: " substr(back, 3) }' \
+        <(om_at "$a" configs.txt) <(om_at "$b" configs.txt)
+    om_listdiff themes themes.txt first
+    om_listdiff plugins plugins.txt first
+    om_listdiff apps apps.txt name
+    om_listdiff toggles toggles.txt line
+    om_listdiff hooks hooks.txt line
+    # new Omarchy defaults this machine lacks (other package news is above)
+    awk 'NR == FNR { o[$0]; next } $1 == "dropped" && !($0 in o) { l = l ", " $2 }
+         END { if (l != "") print "omarchy defaults not installed: " substr(l, 3) }' \
+        <(om_at "$a" packages.txt) <(om_at "$b" packages.txt)
+    if [[ ${3:-} == packages ]]; then
+        awk 'NR == FNR { if ($1 == "added") o[$2]; next }
+             $1 == "added" { n[$2]; if (!($2 in o)) print "+" $2 }
+             END { for (p in o) if (!(p in n)) print "-" p }' \
+            <(om_at "$a" packages.txt) <(om_at "$b" packages.txt) |
+            sort -k1.2 | paste -sd, | sed 's/,/, /g; s/^./omarchy packages beyond the defaults: &/'
+    fi
+    return 0
+}
+
+# an inventory file at a capture (or in the tree, for ""), plus a blank
+# line, so the awk "NR == FNR" idiom still sees two files when one is missing
+inv_at() {  # rev file
+    if [[ -n $1 ]]; then j show "$1:inventory/$2" 2>/dev/null || true
+    else cat "$tree/inventory/$2" 2>/dev/null || true; fi
+    echo
+}
+om_at() { inv_at "$1" "omarchy/$2"; }  # rev file, of the Omarchy profile
+
+# the rest of the setup between two captures (B "" for the tree being
+# committed): packages with versions, services, and between two captures
+# the /etc files
+sys_summary() {  # A B
+    local a=$1 b=$2 sc
+    awk 'NR == FNR { if (NF) { o[$1] = $2; ol[++on] = $1 }; next }
+         NF { n[$1] = $2
+              if (!($1 in o)) ad = ad ", " $1
+              else if (o[$1] != $2) { u++; if (u <= 8) ul = ul ", " $1 " " o[$1] " -> " $2 } }
+         END { for (i = 1; i <= on; i++) if (!(ol[i] in n)) rm = rm ", " ol[i]
+               if (ad != "") print "packages added: " substr(ad, 3)
+               if (rm != "") print "packages removed: " substr(rm, 3)
+               if (u) print "packages upgraded " u ": " substr(ul, 3) (u > 8 ? ", and " u - 8 " more" : "") }' \
+        <(inv_at "$a" pacman.txt) <(inv_at "$b" pacman.txt)
+    for sc in system user; do
+        awk -v label="$([[ $sc == user ]] && echo "user services" || echo services)" '
+            NR == FNR { if (NF) { o[$2] = $1; ol[++on] = $2 }; next }
+            NF { n[$2] = $1
+                 if (!($2 in o)) l = l ", +" $2 ($1 == "enabled" ? "" : " (" $1 ")")
+                 else if (o[$2] != $1) l = l ", ~" $2 " (" o[$2] " -> " $1 ")" }
+            END { for (i = 1; i <= on; i++) if (!(ol[i] in n)) l = l ", -" ol[i]
+                  if (l != "") print label ": " substr(l, 3) }' \
+            <(inv_at "$a" "units-$sc.txt") <(inv_at "$b" "units-$sc.txt")
+    done
+    if [[ -n $a && -n $b ]]; then
+        j diff --no-renames --name-status "$a" "$b" -- files/etc | awk '
+            { c++; m = ($1 == "A" ? "+" : $1 == "D" ? "-" : "")
+              if (c <= 12) l = l ", " m substr($0, index($0, "files/etc/") + 10) }
+            END { if (c) print "/etc: " substr(l, 3) (c > 12 ? ", and " c - 12 " more" : "") }'
+        # the other files: under ~/.config, ~/.local/share and ~/.local/state
+        # a directory per app, folded into "dir/ (n)" past three files
+        j diff --no-renames --name-status "$a" "$b" -- files ':(exclude)files/etc' | awk -v home="$HOME" '
+            { p = substr($0, index($0, "files/") + 5); m = ($1 == "A" ? "+" : $1 == "D" ? "-" : "")
+              if (index(p, home "/") == 1) p = "~" substr(p, length(home) + 1)
+              n = split(p, w, "/"); k = p
+              if (w[1] == "~" && (w[2] == ".config" || (w[2] == ".local" && n > 4))) d = (w[2] == ".config" ? 3 : 4)
+              else d = 2
+              if (n > d) { k = w[1]; for (i = 2; i <= d; i++) k = k "/" w[i]; k = k "/" }
+              c[k]++; ks[NR] = k; item[NR] = m p }
+            END { for (i = 1; i <= NR; i++) {
+                      k = ks[i]
+                      if (c[k] > 3) { if (k in done) continue; done[k]; t = k " (" c[k] ")" }
+                      else t = item[i]
+                      if (++o <= 15) l = l ", " t }
+                  if (o) print "files: " substr(l, 3) (o > 15 ? ", and " o - 15 " more" : "") }'
+    fi
+    return 0
+}
+
+om_listdiff() {  # label file key(first|name|line), with om_summary's a and b
+    # "+new, -gone, ~changed"
+    local items
+    items=$(awk -v mode="$3" '
+        function key(   k, i) {
+            if (mode == "first") return $1
+            if (mode == "name") { k = $3; for (i = 4; i <= NF; i++) k = k " " $i; return k }
+            return $0 }
+        NR == FNR { if (NF) o[key()] = $0; next }
+        NF { k = key(); n[k] = $0; if (!(k in o)) print "+" k; else if (o[k] != $0) print "~" k }
+        END { for (k in o) if (!(k in n)) print "-" k }' \
+        <(om_at "$a" "$2") <(om_at "$b" "$2") |
+        sort -k1.2 | paste -sd, | sed 's/,/, /g')
+    if [[ -n $items ]]; then echo "omarchy $1: $items"; fi
+}
+
+# ------------------------------------------------- omawayback show and changes
+# a label, then the items joined by ", " and wrapped under the label
+om_line() {  # label item...
+    (( $# > 1 )) || return 0
+    local label=$1; shift
+    # break only between items, so "service-dropbox (5)" stays whole
+    printf '%s\n' "$@" | awk -v label="$label" -v w=78 -v pad=11 '
+        { item[NR] = $0 }
+        END {
+            line = sprintf("%-" pad "s", label); len = pad
+            for (i = 1; i <= NR; i++) {
+                t = item[i] (i < NR ? "," : "")
+                if (i > 1 && len + 1 + length(t) > w) {
+                    print line; line = sprintf("%-" pad "s", ""); len = pad
+                } else if (i > 1) { line = line " "; len++ }
+                line = line t; len += length(t)
+            }
+            print line }'
+}
+
+# a desktop entry id as the name Omarchy uses: com.mitchellh.ghostty.desktop -> ghostty
+desktop_name() { local v=${1%.desktop}; v=${v##*.}; printf '%s\n' "${v,,}"; }
+
+no_profile() {  # rev
+    die "capture $(j rev-parse --short "$1") has no Omarchy profile" \
+        "(not an Omarchy machine, or older than omawayback 0.3.0)"
+}
+
+# the machine as Omarchy sees it, at a capture: what it is beyond stock Omarchy
+om_show() {  # rev
+    local r=$1 k v n p w via src
+    pf() { j show "$r:inventory/omarchy/$1" 2>/dev/null || true; }
+    j cat-file -e "$r:inventory/omarchy/settings.txt" 2>/dev/null || no_profile "$r"
+    declare -A S=()
+    while read -r k v; do [[ -n $k ]] && S[$k]=$v; done < <(pf settings.txt)
+    echo "$host, capture $(j rev-parse --short "$r")" \
+         "$(j log -1 --format=%cd --date='format:%F %H:%M' "$r"):" \
+         "Omarchy ${S[version]:--} (${S[channel]:--}, ${S[platform]:--})"
+
+    local theme bg=${S[background]:-}
+    theme=$(sed -E 's/(^|-)([a-z])/\1\u\2/g; s/-/ /g' <<<"${S[theme]:--}")
+    bg=${bg##*/}; bg=${bg%.*}; bg=${bg#[0-9]*-}
+    om_line look "$theme" "${S[font]:--}" ${bg:+"background $bg"}
+    local editor=${S[editor]:--} agent=${S[agent]:--} dict=${S[dictation]:--}
+    [[ $editor != - ]] || editor="nvim (default)"
+    [[ $agent != - ]] || agent=none
+    [[ $dict != - ]] || dict=none
+    local -a dl=("browser $(desktop_name "${S[browser]:--}")"
+                 "terminal $(desktop_name "${S[terminal]:--}")" "editor $editor"
+                 "agent $agent" "dictation $dict")
+    [[ ${S[preinstalls]:-} != removed ]] || dl+=("preinstalls removed")
+    om_line defaults "${dl[@]}"
+    if j cat-file -e "$r:inventory/omarchy/install.txt" 2>/dev/null; then
+        declare -A IN=()
+        while read -r k v; do [[ -n $k ]] && IN[$k]=$v; done < <(pf install.txt)
+        v=${IN[created]:--}; [[ $v == - ]] && v="" || v=", $v"
+        om_line installed "Omarchy ${IN[omarchy-version]:--}$v (@factory)"
+    fi
+
+    # packages, grouped by what installed them
+    local -a menu=() orig=() mine=() drop=() inst=()
+    declare -A ic=()
+    while read -r w p _ via; do
+        case $w in
+            dropped) drop+=("$p") ;;
+            added)
+                case $via in
+                    "") mine+=("$p") ;;
+                    installer) orig+=("$p") ;;
+                    *) IFS=, read -ra v <<<"$via"
+                       for src in "${v[@]}"; do
+                           case $src in
+                               menu:*) menu+=("${src#menu:install.}") ;;
+                               *) src=${src#omarchy-install-}; ic[$src]=$(( ${ic[$src]:-0} + 1 )) ;;
+                           esac
+                       done ;;
+                esac ;;
+        esac
+    done < <(pf packages.txt)
+    for src in $(printf '%s\n' "${!ic[@]}" | sort); do
+        if (( ${ic[$src]} > 1 )); then inst+=("$src (${ic[$src]})"); else inst+=("$src"); fi
+    done
+    n=$(pf packages.txt | grep -c '^added ' || true)
+    om_line packages "$n beyond Omarchy's set"
+    (( ${#inst[@]} )) && om_line "" "Omarchy installers: ${inst[0]}" "${inst[@]:1}"
+    (( ${#menu[@]} )) && om_line "" "Omarchy menu: ${menu[0]}" "${menu[@]:1}"
+    (( ${#orig[@]} )) && om_line "" "from the original install: ${orig[0]}" "${orig[@]:1}"
+    (( ${#mine[@]} )) && om_line "" "yours: ${mine[0]}" "${mine[@]:1}"
+    (( ${#drop[@]} )) && om_line "" "Omarchy defaults not installed: ${drop[0]}" "${drop[@]:1}"
+    if j cat-file -e "$r:inventory/omarchy/install.txt" 2>/dev/null; then om_show_install "$r"
+    else om_line "" "no record of the install yet: sudo omawayback-baseline, once"; fi
+
+    local -a tg=() tl=() tk=()
+    while read -r n k _; do
+        case $k in git) tg+=("$n") ;; link) tk+=("$n") ;; ?*) tl+=("$n") ;; esac
+    done < <(pf themes.txt)
+    n=$(( ${#tg[@]} + ${#tl[@]} + ${#tk[@]} ))
+    if (( n == 0 )); then om_line themes "none of your own"
+    else
+        om_line themes "$n of your own"
+        (( ${#tg[@]} )) && om_line "" "from git: ${tg[0]}" "${tg[@]:1}"
+        (( ${#tl[@]} )) && om_line "" "local: ${tl[0]}" "${tl[@]:1}"
+        (( ${#tk[@]} )) && om_line "" "linked: ${tk[0]}" "${tk[@]:1}"
+    fi
+
+    # plugins by where they sit in the bar; local ones cannot be reinstalled from a URL
+    local -a pl=()
+    declare -A pb=()
+    while read -r n w k _; do
+        [[ -n $n ]] || continue
+        w=${w#bar=}; [[ $k == git ]] || n="$n ($k)"
+        pb[$w]+="$n"$'\n'
+    done < <(pf plugins.txt)
+    if (( ${#pb[@]} == 0 )); then om_line plugins "none of your own"
+    else
+        n=$(pf plugins.txt | grep -c . || true)
+        om_line plugins "$n of your own"
+        for w in $(printf '%s\n' "${!pb[@]}" | sort); do
+            mapfile -t pl < <(printf '%s' "${pb[$w]}")
+            if [[ $w == - ]]; then om_line "" "not in the bar: ${pl[0]}" "${pl[@]:1}"
+            else om_line "" "bar ${w//,/ and }: ${pl[0]}" "${pl[@]:1}"; fi
+        done
+    fi
+
+    local -a am=() ay=() ar=()
+    local shipped=0
+    while read -r k w n; do
+        case $k:$w in
+            removed:*) ar+=("$n") ;;
+            *:shipped) shipped=$((shipped + 1)) ;;
+            *:shipped-modified) am+=("$n") ;;
+            *:yours) ay+=("$n ($k)") ;;
+        esac
+    done < <(pf apps.txt)
+    om_line apps "$shipped of Omarchy's web apps and TUIs as shipped"
+    (( ${#am[@]} )) && om_line "" "Omarchy's, changed by you: ${am[0]}" "${am[@]:1}"
+    (( ${#ay[@]} )) && om_line "" "yours: ${ay[0]}" "${ay[@]:1}"
+    (( ${#ar[@]} )) && om_line "" "Omarchy's, removed: ${ar[0]}" "${ar[@]:1}"
+
+    mapfile -t pl < <(pf toggles.txt | sed '/^$/d; s/^flag //; s/^hypr \(.*\)/\1 (hyprland)/')
+    if (( ${#pl[@]} )); then om_line toggles "${pl[@]}"; else om_line toggles "none on"; fi
+
+    declare -A hk=()
+    while IFS= read -r p; do
+        [[ -n $p ]] || continue
+        if [[ $p == */* ]]; then k=${p%%/*}; k=${k%.d}; hk[$k]+="${p#*/}"$'\n'
+        else hk[$p]+="$p"$'\n'; fi
+    done < <(pf hooks.txt)
+    if (( ${#hk[@]} == 0 )); then om_line hooks "none of your own"
+    else
+        w=hooks
+        for k in $(printf '%s\n' "${!hk[@]}" | sort); do
+            mapfile -t pl < <(printf '%s' "${hk[$k]}")
+            om_line "$w" "$k: ${pl[0]}" "${pl[@]:1}"; w=""
+        done
+    fi
+
+    mapfile -t pl < <(pf configs.txt | awk '$1 == "custom" { print substr($0, length($1 $2) + 3) }')
+    n=$(pf configs.txt | grep -c . || true)
+    if (( ${#pl[@]} )); then om_line configs "${#pl[@]} of $n shipped configs customized: ${pl[0]}" "${pl[@]:1}"
+    else om_line configs "all $n shipped configs as Omarchy ships them"; fi
+
+    n=$(pf migrations.txt | grep -c . || true)
+    k=$(pf migrations.txt | sed '/^$/d' | sort -n | tail -1)
+    om_line migrations "$n run${k:+, latest $k}"
+
+    declare -A H=()
+    local -a errs=()
+    while read -r k v; do
+        case $k in
+            hyprland-config-error) errs+=("$v") ;;
+            ?*) H[$k]=$v ;;
+        esac
+    done < <(pf health.txt)
+    om_line health "${H[migrations-pending]:-0} migrations pending" \
+        "$(if [[ -z ${H[hyprland-config-errors]:-} ]]; then echo "Hyprland not checked (no session yet)"
+           elif (( ${H[hyprland-config-errors]} == 0 )); then echo "no Hyprland config errors"
+           else echo "${H[hyprland-config-errors]} Hyprland config errors:"; fi)"
+    for v in "${errs[@]}"; do printf '%-11s  %s\n' "" "$v"; done
+    return 0
+}
+
+# paths relative to /etc, those sharing a directory folded into "dir/ (n)"
+# when there are more than three of them
+etc_fold() {
+    sed 's|^/etc/||' | awk '
+        { k = $0; if (index(k, "/")) k = substr(k, 1, index(k, "/")); c[k]++; ks[NR] = k; l[NR] = $0 }
+        END { for (i = 1; i <= NR; i++) {
+                  k = ks[i]
+                  if (c[k] > 3) { if (!(k in done)) { print k " (" c[k] ")"; done[k] } }
+                  else print l[i] } }'
+}
+
+# the packages, services and /etc lines of show, against the install
+om_show_install() {  # rev
+    local r=$1 k v n w st
+    local -A I=()
+    while read -r k v; do [[ -n $k ]] && I[$k]=$v; done < <(pf install.txt)
+    local na no nr
+    local -a ro=() ry=()
+    na=$(pf install-packages.txt | awk '$1 == "added"' | grep -c . || true)
+    no=$(pf install-packages.txt | awk '$1 == "added" && $3 == "omarchy"' | grep -c . || true)
+    mapfile -t ro < <(pf install-packages.txt | awk '$1 == "removed" && $3 != "yours" { print $2 }')
+    mapfile -t ry < <(pf install-packages.txt | awk '$1 == "removed" && $3 == "yours" { print $2 }')
+    nr=$(( ${#ro[@]} + ${#ry[@]} ))
+    om_line "" "since the install: $na added ($no with Omarchy's set, the rest above), $nr removed"
+    (( ${#ro[@]} )) && om_line "" "dropped or replaced by Omarchy: ${ro[0]}" "${ro[@]:1}"
+    (( ${#ry[@]} )) && om_line "" "removed by you: ${ry[0]}" "${ry[@]:1}"
+
+    # services: Omarchy's and yours, system and user
+    local -A grp=()
+    local u now was item sc
+    while read -r u now was w; do
+        [[ -n $u ]] || continue
+        sc=system; [[ $u == user/* ]] && { sc=user; u=${u#user/}; }
+        item=${u%.service}
+        local -a note=()
+        case $now in off|masked) note+=("$now") ;; esac
+        if [[ $w == yours-over ]]; then
+            if [[ $now == off || $now == masked ]]; then note+=("Omarchy turns it on")
+            else note+=("Omarchy turns it off"); fi
+            w=yours
+        fi
+        (( ${#note[@]} )) && item+=" ($(IFS=';'; printf '%s' "${note[*]}" | sed 's/;/; /g'))"
+        grp[$sc:$w]+="$item"$'\n'
+    done < <(pf install-units.txt)
+    n=$(pf install-units.txt | grep -c . || true)
+    local -a it=()
+    if (( n == 0 )); then om_line services "as installed"
+    else
+        om_line services "$n changed since the install"
+        for k in system:omarchy system:yours user:omarchy user:yours; do
+            [[ -n ${grp[$k]:-} ]] || continue
+            mapfile -t it < <(printf '%s' "${grp[$k]}")
+            case $k in
+                system:omarchy) w="Omarchy's" ;; system:yours) w="yours" ;;
+                user:omarchy) w="user, Omarchy's" ;; user:yours) w="user, yours" ;;
+            esac
+            om_line "" "$w: ${it[0]}" "${it[@]:1}"
+        done
+    fi
+
+    # /etc
+    local -A cnt=()
+    while read -r st _; do [[ -n $st ]] && cnt[$st]=$(( ${cnt[$st]:-0} + 1 )); done < <(pf install-etc.txt)
+    om_line /etc "since the install: ${cnt[changed]:-0} changed, ${cnt[added]:-0} added, ${cnt[removed]:-0} removed; ${I[etc-same]:-0} as installed"
+    for k in yours omarchy system leftover pacnew; do
+        mapfile -t it < <(pf install-etc.txt | awk -v w="$k" '$2 == w { print substr($0, length($1 $2) + 3) }' | etc_fold)
+        (( ${#it[@]} )) || continue
+        case $k in
+            yours) w="yours" ;; omarchy) w="Omarchy's" ;; system) w="the system's own" ;;
+            leftover) w="leftovers" ;; pacnew) w=".pacnew waiting" ;;
+        esac
+        om_line "" "$w: ${it[0]}" "${it[@]:1}"
+    done
+    n=$(pf install-etc.txt | awk '$2 == "package"' | grep -c . || true)
+    (( n == 0 )) || om_line "" "from packages, as shipped: $n files"
+    mapfile -t it < <(pf install-etc.txt | awk '$1 == "removed" { print substr($0, length($1 $2) + 3) }' | etc_fold)
+    (( ${#it[@]} )) && om_line "" "removed: ${it[0]}" "${it[@]:1}"
+    return 0
+}
+
+# the setup between two captures: Omarchy's level, then the rest
+setup_summary() {  # A B
+    om_summary "$1" "$2"
+    sys_summary "$1" "$2"
+}
+
+# the captures where the setup changed, newest first, each with its
+# changes; the first capture, and the first with an Omarchy profile, say so
+om_log() {
+    local c p out head n=0
+    while read -r c p _ <&3; do
+        if [[ -z ${p:-} ]]; then
+            out="first capture"
+            if j cat-file -e "$c:inventory/omarchy/settings.txt" 2>/dev/null; then
+                out+=", Omarchy $(j show "$c:inventory/omarchy/settings.txt" |
+                    awk '$1 == "version" { sub(/^version /, ""); print; exit }')"
+            fi
+        elif j cat-file -e "$c:inventory/omarchy/settings.txt" 2>/dev/null &&
+             ! j cat-file -e "$p:inventory/omarchy/settings.txt" 2>/dev/null; then
+            out="Omarchy profile first recorded: Omarchy $(j show "$c:inventory/omarchy/settings.txt" |
+                awk '$1 == "version" { sub(/^version /, ""); print; exit }')"
+            out+=$(sys_summary "$p" "$c" | sed 's/^/\n/')
+        else
+            out=$(setup_summary "$p" "$c")
+            [[ -n $out ]] || continue
+        fi
+        # hash, date, and the -m label if the capture has one
+        head=$(j log -1 --format='%h %cd %s' --date='format:%F %H:%M' "$c" |
+            sed -E 's/^([^ ]+ [^ ]+ [^ ]+) capture [^ ]+ [0-9-]+ [0-9]+:[0-9]+(: )?/\1  /; s/ +$//')
+        printf '%s\n' "$head"; sed 's/^/  /' <<<"$out"
+        j notes --ref="$notes_ref" show "$c" 2>/dev/null | sed 's/^/  note: /' || true
+        n=$((n + 1))
+    done 3< <(j log --format='%H %P')
+    (( n )) || echo "no captures yet"
+    return 0
+}
+
+# ------------------------------------------------- omawayback replay
+# A script that rebuilds a capture's setup on a fresh Omarchy: Omarchy's
+# level with Omarchy's own commands, then the rest of the scope with
+# omawayback restore, your user services, your tools, and (after asking) your
+# /etc files and system services. Printed, never run. Nothing is removed
+# unless the reader uncomments it; questions are left by hand.
+
+# a path under $HOME as script text: "$HOME"/rest, the rest quoted
+om_home() { local r=${1#"$HOME"/}; printf '"$HOME"/%s' "$(printf '%q' "$r")"; }
+om_q() { printf '%q' "$1"; }
+om_dq() { local v=${1//\\/\\\\}; v=${v//\"/\\\"}; v=${v//\$/\\\$}; v=${v//\`/\\\`}; printf '"%s"' "$v"; }
+om_in() { j cat-file -e "$rv:files$1" 2>/dev/null; }  # path in the capture (uses rv)
+
+# the browser name Omarchy's setter takes, from a desktop entry id
+om_browser() {
+    case $(desktop_name "$1") in
+        google-chrome*|chrome) echo chrome ;;
+        brave-browser|brave) echo brave ;;
+        brave-origin*) echo brave-origin ;;
+        microsoft-edge*|edge) echo edge ;;
+        zen*) echo zen ;;
+        *) desktop_name "$1" ;;
+    esac
+}
+
+# an Omarchy command's fixed choices (omarchy:args=<a|b>), one per line
+om_args() {
+    sed -n 's/^# omarchy:args=[<[]\([^]>]*\)[]>].*/\1/p' "$OMARCHY_PATH/bin/$1" 2>/dev/null |
+        head -1 | tr '|' '\n'
+}
+om_asks() { grep -qE 'gum (choose|input|confirm|write|filter)|read -' "$OMARCHY_PATH/bin/$1" 2>/dev/null; }
+
+om_replay() {  # rev
+    local rv short date k v
+    rv=$(j rev-parse "$1^{commit}")
+    j cat-file -e "$rv:inventory/omarchy/settings.txt" 2>/dev/null || no_profile "$rv"
+    short=$(j rev-parse --short "$rv")
+    date=$(j log -1 --format=%cd --date='format:%F %H:%M' "$rv")
+    local -A S=()
+    while read -r k v; do [[ -n $k ]] && S[$k]=$v; done < <(om_at "$rv" settings.txt)
+    local -a paths=() byhand=() removals=()
+    local oc=$HOME/.config/omarchy
+
+    cat <<EOF
+#!/bin/bash
+# Rebuild $host's setup as it was in capture $short ($date), Omarchy
+# ${S[version]:--} (${S[channel]:--}): packages, Omarchy's settings, your files,
+# user services and tools, and, if you say yes when asked, your /etc files
+# and system services. Written by \`$prog replay $short\` (omawayback $version).
+# Read it before running it, and comment out what this machine should not
+# get (monitors and input are machine-specific).
+#
+# Run it on the desktop, not over ssh (the shell, theme and font commands
+# talk to the session), as $USER, on Omarchy, with $host's journal in
+# ~/.local/state/omawayback and $prog on the PATH. It adds and sets; nothing
+# is removed unless you uncomment it at the end. A step that fails is
+# listed at the end and the rest still run.
+
+rev=$rv
+failed=()
+run() { printf '\n+ %s\n' "\$*"; "\$@" || failed+=("\$*"); }
+here=\$(omarchy-version 2>/dev/null || echo unknown)
+[[ \$here == $(om_q "${S[version]:--}") ]] ||
+    echo "note: this is Omarchy \$here; the capture was ${S[version]:--}"
+EOF
+
+    # --- packages
+    local -a pk=() inst=() plain=()
+    local p src s f
+    local -A foreign=() byinst=()
+    while read -r p; do [[ -n $p ]] && foreign[$p]=1; done < <(j show "$rv:inventory/pacman-foreign.txt" 2>/dev/null || true)
+    while read -r k p v src; do
+        [[ $k == added ]] || continue
+        f=""
+        if [[ $v == via ]]; then
+            local -a srcs=()
+            IFS=, read -ra srcs <<<"$src"
+            for s in "${srcs[@]}"; do [[ $s == omarchy-install-* ]] && { f=$s; break; }; done
+        fi
+        if [[ -n $f && -f $OMARCHY_PATH/bin/$f ]]; then
+            [[ -n ${byinst[$f]:-} ]] || inst+=("$f")
+            byinst[$f]+="$p "
+        else
+            plain+=("$p ${src:-}")
+        fi
+    done < <(om_at "$rv" packages.txt)
+
+    echo
+    echo "# --- packages beyond Omarchy's set ------------------------------------------"
+    if (( ${#inst[@]} )); then
+        echo "# through Omarchy's installers, which set up more than the package"
+        local choices pk1 m
+        for f in "${inst[@]}"; do
+            choices=$(om_args "$f"); m=0
+            for pk1 in ${byinst[$f]}; do
+                if grep -qx -- "$pk1" <<<"$choices"; then echo "run $f $(om_q "$pk1")"; m=1; fi
+            done
+            (( m )) && continue
+            if om_asks "$f" || grep -q '^# omarchy:args=<' "$OMARCHY_PATH/bin/$f"; then
+                echo "# $f    # asks or needs a choice: run it by hand (it installed ${byinst[$f]% })"
+                byhand+=("$f")
+            else
+                echo "run $f"
+            fi
+        done
+    fi
+    if (( ${#plain[@]} )); then
+        echo "# one at a time, so a package that is gone or renamed stops only itself;"
+        echo "# foreign packages are from the AUR or were built here"
+        local line note
+        for line in "${plain[@]}"; do
+            p=${line%% *}; src=${line#* }
+            case $src in
+                installer*) note="  # in the original install" ;;
+                *menu:*) note="  # Omarchy menu: ${src##*menu:}"; note=${note%%,*} ;;
+                *) note="" ;;
+            esac
+            if [[ -n ${foreign[$p]:-} ]]; then echo "run omarchy-pkg-aur-add $(om_q "$p")$note"
+            else echo "run omarchy-pkg-add $(om_q "$p")$note"; fi
+        done
+    fi
+    while read -r k p; do
+        [[ $k == dropped ]] && removals+=("run omarchy-pkg-drop $(om_q "$p")    # an Omarchy default the capture did not have")
+    done < <(om_at "$rv" packages.txt)
+
+    # --- themes
+    local name kind url commit dir
+    local -A gitthemes=()
+    echo
+    echo "# --- themes ------------------------------------------------------------------"
+    echo "# git themes are cloned, not installed with omarchy-theme-install, which"
+    echo "# switches to each theme it installs; the theme is set once, at the end"
+    while read -r name kind url commit; do
+        [[ -n $name ]] || continue
+        dir=$oc/themes/$name
+        case $kind in
+            git) if [[ $url != - ]]; then
+                     gitthemes[$name]=1
+                     echo "[[ -e $(om_home "$dir") ]] || run git clone -q -- $(om_q "$url") $(om_home "$dir")  # was at $commit"
+                     continue
+                 fi ;;
+            link) echo "# $name is a link to $url: ln -s $(om_q "$url") $(om_home "$dir")"
+                  byhand+=("link theme $name"); continue ;;
+        esac
+        if om_in "$dir"; then paths+=("$dir	local theme")
+        else echo "# $name: local, but not in the capture's files"; fi
+    done < <(om_at "$rv" themes.txt)
+
+    # --- plugins: added from git or restored; placement comes from shell.json
+    local id bar rest
+    local -A pdir=()
+    local base=$HOME/.config/omarchy/plugins
+    while read -r dir; do
+        [[ -n $dir ]] || continue
+        id=$(j show "$rv:files$base/$dir/manifest.json" 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true)
+        pdir[${id:-$dir}]=$dir
+    done < <(j ls-tree --name-only "$rv:files$base/" 2>/dev/null || true)
+    local shell_custom=0 nplug=0
+    # (no "| grep -q" here: under pipefail, its early exit fails the pipe)
+    grep -q '^custom [^ ]* omarchy/shell\.json$' < <(om_at "$rv" configs.txt) && shell_custom=1
+    echo
+    echo "# --- shell plugins -----------------------------------------------------------"
+    if (( shell_custom )); then
+        echo "# where each sits in the bar comes back with ~/.config/omarchy/shell.json"
+    fi
+    while read -r id bar kind url commit; do
+        [[ -n $id ]] || continue
+        nplug=$((nplug + 1))
+        bar=${bar#bar=}; dir=$base/${pdir[$id]:-$id}
+        case $kind in
+            git) if [[ $url != - ]]; then
+                     echo "[[ -e $(om_home "$dir") ]] || run omarchy-plugin-add $(om_q "$url") --yes  # was at $commit"
+                 fi ;;
+            link) echo "# $id is a link to $url: ln -s $(om_q "$url") $(om_home "$dir")"
+                  byhand+=("link plugin $id") ;;
+        esac
+        if [[ $kind == local || ( $kind == git && $url == - ) ]]; then
+            if om_in "$dir"; then paths+=("$dir	local plugin")
+            else echo "# $id: local, but not in the capture's files"; fi
+        fi
+        if (( ! shell_custom )) && [[ $bar != - ]]; then
+            echo "run omarchy-plugin-enable $(om_q "$id") --section $(om_q "${bar%%,*}")"
+        fi
+    done < <(om_at "$rv" plugins.txt)
+
+    # --- apps
+    local origin app=$HOME/.local/share/applications icons=$HOME/.local/share/icons/hicolor/256x256/apps icon
+    while read -r kind origin name; do
+        [[ -n $kind ]] || continue
+        if [[ $kind == removed ]]; then
+            removals+=("rm -f $(om_home "$app/$name.desktop")    # an Omarchy app the capture did not have")
+            continue
+        fi
+        [[ $origin == shipped ]] && continue
+        f=$app/$name.desktop
+        if ! om_in "$f"; then
+            echo "# app $name: not in the capture's files; omarchy-${kind}-install makes it again"
+            byhand+=("app $name"); continue
+        fi
+        paths+=("$f	$kind ($origin)")
+        icon=$(j show "$rv:files$f" 2>/dev/null | sed -n 's/^Icon=//p' | head -1)
+        if [[ $icon == /* ]]; then
+            om_in "$icon" && paths+=("$icon	its icon")
+        elif [[ -n $icon ]]; then
+            while read -r k; do
+                [[ $k == "$icon".* ]] && paths+=("$icons/$k	its icon")
+            done < <(j ls-tree --name-only "$rv:files$icons/" 2>/dev/null || true)
+        fi
+    done < <(om_at "$rv" apps.txt)
+
+    # --- toggles
+    echo
+    echo "# --- toggles (the ones on in the capture; the rest stay as Omarchy set them) -"
+    local nt=0
+    while read -r kind name; do
+        case $kind in
+            flag) echo "run omarchy-toggle $(om_q "$name") on"; nt=1 ;;
+            hypr) echo "run omarchy-hyprland-toggle $(om_q "$name") on"; nt=1 ;;
+        esac
+    done < <(om_at "$rv" toggles.txt)
+    (( nt )) || echo "# (none)"
+
+    # --- files: hooks, customized configs, your additions, theme state
+    while read -r p; do
+        [[ -n $p ]] && om_in "$oc/hooks/$p" && paths+=("$oc/hooks/$p	hook")
+    done < <(om_at "$rv" hooks.txt)
+    local -a bases=()
+    local st h rel
+    while read -r st h rel; do
+        [[ $st == custom ]] || continue
+        if om_in "$HOME/.config/$rel"; then
+            paths+=("$HOME/.config/$rel	customized config")
+            bases+=("$h $rel")
+        fi
+    done < <(om_at "$rv" configs.txt)
+    # files you added to the directories Omarchy configures, as the largest
+    # directories that hold nothing Omarchy ships
+    local tops top
+    tops=$(om_at "$rv" configs.txt | awk 'NF >= 3 { split($3, a, "/"); print a[1] }' | sort -u)
+    while read -r rel; do
+        [[ -n $rel ]] && paths+=("$HOME/.config/$rel	your addition")
+    done < <(
+        {
+            om_at "$rv" configs.txt | awk 'NF >= 3 { print "S " $3 }'
+            for top in $tops; do
+                j -c core.quotePath=false ls-tree -r --name-only "$rv" -- "files$HOME/.config/$top/" 2>/dev/null |
+                    sed "s|^files$HOME/.config/|U |"
+            done
+        } | awk '
+            $1 == "S" { n = split($2, a, "/"); p = a[1]; t[p]
+                        for (i = 2; i <= n; i++) { p = p "/" a[i]; t[p] } next }
+            $2 ~ /^omarchy\/(themes|plugins|hooks)\// { next }
+            # samples, backup copies and locks are not worth bringing back
+            $2 ~ /\.(sample|lock|orig|old|swp)$|~$|\.bak($|[.-][^\/]*$)|\.pre-[^\/]*$/ { next }
+            { n = split($2, a, "/"); p = a[1]
+              for (i = 2; i <= n; i++) { p = p "/" a[i]; if (!(p in t)) { if (!(p in seen)) print p; seen[p]; break } } }')
+    om_in "$HOME/.local/state/omarchy/theme-backgrounds" &&
+        paths+=("$HOME/.local/state/omarchy/theme-backgrounds	the background each theme was on")
+    local bg=${S[background]:-}
+    [[ $bg == "~/"* ]] && bg=$HOME/${bg#\~/}
+    # current/theme is staged by omarchy-theme-set, which runs later
+    if [[ -n $bg && $bg != "$OMARCHY_PATH"/* && $bg != "$HOME/.local/state/omarchy/current/theme/"* ]]; then
+        local covered=0 e g
+        for e in "${paths[@]}"; do [[ $bg == "${e%%	*}"/* ]] && covered=1; done
+        for g in "${!gitthemes[@]}"; do [[ $bg == "$oc/themes/$g"/* ]] && covered=1; done
+        (( covered )) || ! om_in "$bg" || paths+=("$bg	the background")
+    fi
+
+    # the rest of the scope in your home (shell, ~/bin, agents, tools), each
+    # under the scope's own heading; not what Omarchy configures, which the
+    # lines above bring back file by file
+    local label="the rest of your scope" line rr dd ee skipr prev=blank
+    local -a omdirs=("$oc" "$HOME/.local/state/omarchy" "$app" "$HOME/.local/share/icons")
+    for top in $tops; do omdirs+=("$HOME/.config/$top"); done
+    while IFS= read -r line; do
+        line=${line#"${line%%[![:space:]]*}"}
+        # a heading is a comment after a blank line; others are notes
+        case $line in
+            "") prev=blank; continue ;;
+            "#"*) [[ $prev == blank ]] && { label=${line#"#"}; label=${label# }; }
+                  [[ -n $label ]] || label="the rest of your scope"
+                  prev=comment; continue ;;
+            "~"|"~/"*) prev=path; line=${line%%#*}; line=${line%"${line##*[![:space:]]}"}; rr=$HOME${line#\~} ;;
+            *) prev=path; continue ;;
+        esac
+        rr=${rr%/}; skipr=0
+        for dd in "${omdirs[@]}"; do [[ $rr == "$dd" || $rr == "$dd"/* ]] && skipr=1; done
+        for ee in "${paths[@]}"; do
+            ee=${ee%%	*}; [[ $rr == "$ee" || $rr == "$ee"/* || $ee == "$rr"/* ]] && skipr=1
+        done
+        (( skipr )) || ! om_in "$rr" || paths+=("$rr	$label")
+    done < <(j show "$rv:policy/scope" 2>/dev/null || true)
+
+    if (( ${#paths[@]} )); then
+        echo
+        echo "# --- your files, from the journal (one restore, one capture) ----------------"
+        echo "paths=("
+        local last="" e
+        for e in "${paths[@]}"; do
+            if [[ ${e#*	} != "$last" ]]; then last=${e#*	}; echo "    # $last"; fi
+            echo "    $(om_home "${e%%	*}")"
+        done
+        echo ")"
+        echo 'run omawayback restore "$rev" "${paths[@]}"'
+        if (( ${#bases[@]} )); then
+            echo "# Omarchy's version of each config you customize, as the capture had it;"
+            echo "# where this Omarchy's differs, merge Omarchy's change in afterwards"
+            echo "bases=("
+            for e in "${bases[@]}"; do echo "    $(om_dq "$e")"; done
+            echo ")"
+        fi
+        echo 'gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true'
+    fi
+
+    # --- services: yours since the install (Omarchy's come with Omarchy)
+    local -a ulines=() slines=() elines=() enotes=()
+    local u now was who c usc
+    echo
+    echo "# --- your user services ------------------------------------------------------"
+    if j cat-file -e "$rv:inventory/omarchy/install-units.txt" 2>/dev/null; then
+        while read -r u now was who; do
+            [[ $who == yours || $who == yours-over ]] || continue
+            usc=system; [[ $u == user/* ]] && { usc=user; u=${u#user/}; }
+            case $now in enabled) c=enable ;; masked) c=mask ;; off) c=disable ;; *) c="" ;; esac
+            if [[ -z $c ]]; then
+                echo "# $u ($usc) was $now: set it by hand"; byhand+=("$usc service $u: $now"); continue
+            fi
+            if [[ $usc == user ]]; then ulines+=("run systemctl --user $c $(om_q "$u")")
+            else slines+=("run sudo systemctl $c $(om_q "$u")$([[ $who == yours-over ]] && echo "    # Omarchy sets it the other way" || true)"); fi
+        done < <(om_at "$rv" install-units.txt)
+        if (( ${#ulines[@]} )); then
+            echo "# the ones you turned on or masked; Omarchy's come with Omarchy. They"
+            echo "# start at your next login (or: systemctl --user start UNIT)"
+            echo "run systemctl --user daemon-reload"
+            printf '%s\n' "${ulines[@]}"
+        else echo "# (none of your own)"; fi
+    else
+        echo "# no record of the install, so yours cannot be told from Omarchy's;"
+        echo "# ~/.config/systemd/user comes back with the files above if the scope has"
+        echo "# it. Enabled then: omawayback git show $short:inventory/units-user.txt"
+    fi
+
+    # --- tools
+    local -a tl=()
+    local n nm ver pre
+    n=$(j show "$rv:inventory/mise.json" 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+    if (( n > 0 )); then
+        tl+=("# mise: the $n tools of ~/.config/mise, restored above")
+        tl+=("command -v mise >/dev/null && run mise install")
+    fi
+    while read -r pre nm; do
+        [[ -n $nm ]] || continue
+        ver=${nm##*@}; nm=${nm%@*}
+        [[ $nm == npm || $nm == corepack ]] && continue
+        if [[ $pre == "~/.local/share/mise/installs/node/"* ]]; then
+            tl+=("run mise exec node@${pre##*/} -- npm install -g $(om_q "$nm")    # was $ver")
+        elif pacman -Qqo "/usr/lib/node_modules/$nm" >/dev/null 2>&1; then
+            continue    # a pacman package's, back with the packages
+        else
+            tl+=("# sudo npm install -g $(om_q "$nm")    # was $ver, in the system's node: by hand")
+            byhand+=("npm $nm (system node)")
+        fi
+    done < <(j show "$rv:inventory/npm-global.txt" 2>/dev/null || true)
+    while read -r nm _; do
+        [[ -n $nm && $nm != - ]] && tl+=("command -v uv >/dev/null && run uv tool install $(om_q "$nm")")
+    done < <(j show "$rv:inventory/uv-tools.txt" 2>/dev/null || true)
+    while IFS=$'\t' read -r nm ver pre; do
+        [[ -n $nm ]] && tl+=("run flatpak install -y --noninteractive $(om_q "${pre:-flathub}") $(om_q "$nm")")
+    done < <(j show "$rv:inventory/flatpak.txt" 2>/dev/null || true)
+    if (( ${#tl[@]} )); then
+        echo
+        echo "# --- your tools ---------------------------------------------------------------"
+        echo 'cd "$HOME"'
+        printf '%s\n' "${tl[@]}"
+    fi
+
+    # --- /etc: your files since the install, with their mode and owner
+    if j cat-file -e "$rv:inventory/omarchy/install-etc.txt" 2>/dev/null; then
+        local -A meta=() unread=()
+        local sym oct own pth st
+        while read -r st pth; do [[ $st == unreadable ]] && unread[$pth]=1; done \
+            < <(j show "$rv:coverage.txt" 2>/dev/null || true)
+        while read -r sym oct own pth; do [[ $pth == /etc/* ]] && meta[$pth]="$oct $own"; done \
+            < <(j show "$rv:metadata/files.txt" 2>/dev/null || true)
+        while read -r st who pth; do
+            if [[ $st == removed ]]; then
+                removals+=("sudo rm $(om_q "$pth")    # there at the install, gone in the capture"); continue
+            fi
+            [[ $who == yours ]] || continue
+            if ! om_in "$pth"; then
+                if [[ -n ${unread[$pth]:-} ]]; then
+                    enotes+=("# $pth: yours, but not readable by you, so never captured: by hand")
+                    byhand+=("$pth (not readable, not in the journal)")
+                else enotes+=("# $pth: yours, but not in the capture's files (the scope needs @etc)"); fi
+                continue
+            fi
+            if [[ $(j ls-tree "$rv" -- "files$pth" | cut -d' ' -f1) == 120000 ]]; then
+                elines+=("run sudo ln -sfn $(om_q "$(j show "$rv:files$pth")") $(om_q "$pth")")
+            else
+                read -r oct own <<<"${meta[$pth]:-644 root:root}"
+                elines+=("run put_etc $(om_q "$pth") $oct $(om_q "$own")")
+            fi
+        done < <(om_at "$rv" install-etc.txt)
+    else
+        echo
+        echo "# --- /etc: no record of the install, so yours cannot be told from the rest;"
+        echo "# see omawayback show, then omawayback cat $short /etc/X | sudo tee /etc/X"
+    fi
+    if (( ${#elines[@]} + ${#slines[@]} + ${#enotes[@]} )); then
+        echo
+        echo "# --- the system: your /etc files and services, with sudo, after asking -------"
+        (( ${#enotes[@]} )) && printf '%s\n' "${enotes[@]}"
+    fi
+    if (( ${#elines[@]} + ${#slines[@]} )); then
+        echo "# Leave this out where something else owns the system side (ansible, say)."
+        echo "# The file each one replaces is saved under ~/.local/state/omawayback/restored/."
+        cat <<'EOF'
+saved=$HOME/.local/state/omawayback/restored/replay-$(date +%Y%m%d-%H%M%S)
+put_etc() {  # path mode owner:group: the capture's copy, the current one saved first
+    local t rc
+    if [[ -r $1 ]]; then mkdir -p "$saved${1%/*}" && cp -p "$1" "$saved$1"; fi
+    t=$(mktemp) || return 1
+    omawayback cat "$rev" "$1" >"$t" && sudo install -D -m "$2" -o "${3%%:*}" -g "${3#*:}" "$t" "$1"
+    rc=$?; rm -f "$t"; return $rc
+}
+EOF
+        echo "read -rp \"Put back ${#elines[@]} /etc files and ${#slines[@]} system services with sudo? [y/N] \" answer || answer=n"
+        echo 'if [[ $answer == [yY]* ]]; then'
+        for e in "${elines[@]}"; do echo "    $e"; done
+        local el="${elines[*]}"
+        [[ $el == *" /etc/ca-certificates/trust-source/"* ]] && echo "    run sudo update-ca-trust"
+        [[ $el == *" /etc/ufw/"* ]] && echo "    command -v ufw >/dev/null && run sudo ufw reload"
+        if (( ${#slines[@]} )); then
+            echo "    run sudo systemctl daemon-reload"
+            for e in "${slines[@]}"; do echo "    $e"; done
+        fi
+        echo '    echo "the system part is in place; a reboot applies all of it"' 
+        echo 'else'
+        echo '    echo "the system part was skipped: run this script again and answer y, or do it by hand"'
+        echo 'fi'
+    fi
+    (( nplug || shell_custom )) && { echo; echo "run omarchy-restart-shell"; }
+
+    # --- look and defaults, last
+    echo
+    echo "# --- look and defaults -------------------------------------------------------"
+    [[ ${S[font]:--} != - ]] && echo "run omarchy-font-set $(om_dq "${S[font]}")"
+    [[ ${S[theme]:--} != - ]] && echo "run omarchy-theme-set $(om_dq "${S[theme]}")"
+    [[ -n $bg ]] && echo "run omarchy-theme-bg-set $(if [[ $bg == "$HOME"/* ]]; then om_home "$bg"; else om_q "$bg"; fi)"
+    local -a dset=()
+    [[ ${S[browser]:--} != - ]] && dset+=("browser $(om_browser "${S[browser]}")")
+    [[ ${S[terminal]:--} != - ]] && dset+=("terminal $(desktop_name "${S[terminal]}")")
+    [[ ${S[editor]:--} != - ]] && dset+=("editor ${S[editor]}")
+    for e in "${dset[@]}"; do
+        k=${e%% *}; v=${e#* }
+        if [[ -f $OMARCHY_PATH/bin/omarchy-default-$k ]] && ! grep -qx -- "$v" < <(om_args "omarchy-default-$k"); then
+            echo "# omarchy-default-$k $(om_q "$v")    # not one of this Omarchy's choices"
+            byhand+=("default $k $v")
+        else
+            echo "run omarchy-default-$k $(om_q "$v")"
+        fi
+    done
+    for k in agent dictation; do
+        [[ ${S[$k]:--} != - ]] || continue
+        echo "# omarchy-default-$k $(om_q "${S[$k]}")    # opens a terminal to install or launch it: run it by hand"
+        byhand+=("omarchy-default-$k ${S[$k]}")
+    done
+
+    # --- removals, all commented out
+    echo
+    echo "# --- what the capture did not have: uncomment to remove ----------------------"
+    [[ ${S[preinstalls]:-} == removed ]] && echo "# run omarchy-remove-preinstalls"
+    for e in "${removals[@]}"; do echo "# $e"; done
+    (( ${#removals[@]} )) || [[ ${S[preinstalls]:-} == removed ]] || echo "# (nothing)"
+
+    # --- the end: what failed, what is left, what to merge
+    echo
+    echo "# --- the end -----------------------------------------------------------------"
+    echo 'echo'
+    echo 'if (( ${#failed[@]} )); then echo "failed:"; printf "  %s\n" "${failed[@]}"; else echo "every step ran"; fi'
+    if (( ${#byhand[@]} )); then
+        echo "byhand=("
+        for e in "${byhand[@]}"; do echo "    $(om_dq "$e")"; done
+        echo ")"
+        echo 'echo "left to do by hand (see the comments above):"; printf "  %s\n" "${byhand[@]}"'
+    fi
+    if (( ${#bases[@]} )); then
+        cat <<'EOF'
+for b in "${bases[@]}"; do
+    h=$(sha256sum <"${OMARCHY_PATH:-/usr/share/omarchy}/config/${b#* }" 2>/dev/null | cut -c1-12)
+    [[ $h == "${b%% *}" ]] ||
+        echo "Omarchy changed ${b#* } since the capture: omawayback merge ${b#* } ${rev:0:7}"
+done
+EOF
+    fi
+    echo "# By hand, unless the scope records them: ssh and gpg keys, keyrings, gh and"
+    echo "# agent logins. Always by hand: Wi-Fi and VPN secrets (root's, in /etc) and"
+    echo "# your data."
+}
+
+# ------------------------------------------------- omawayback merge
+# When Omarchy changed a default you customize: three-way merge of the
+# shipped file your copy was made against (from the journal), your copy, and
+# Omarchy's file now. Shows the result; writes only with -w, and only when
+# it merged cleanly, saving the copy it replaces and recording a capture.
+
+# a config's path under ~/.config from FILE (hypr/x.lua, ~/.config/hypr/x.lua)
+om_rel() {
+    local p=$1
+    if [[ $p == "~/"* || $p == /* || $p == ./* ]]; then
+        p=$(abs_path "$p")
+        [[ $p == "$HOME/.config/"* ]] || die "$(tilde "$p") is not under ~/.config"
+        p=${p#"$HOME/.config/"}
+    fi
+    printf '%s\n' "$p"
+}
+
+# the shipped file your copy was made against: Omarchy's copy as recorded
+# in the capture where your copy last changed (or in BASE-REV), into $2;
+# prints that capture
+om_base() {  # rel out [base-rev]
+    local rel=$1 out=$2 c
+    if [[ -n ${3:-} ]]; then c=$3
+    else
+        c=$(j log -1 --format=%H -- ":(top)files$HOME/.config/$rel")
+        [[ -n $c ]] || die "~/.config/$rel is not in the journal"
+        # history before 0.3.0 has no shipped copies: take the first that has
+        j cat-file -e "$c:inventory/omarchy/configs.txt" 2>/dev/null ||
+            c=$(j log --reverse --format=%H "$c..HEAD" -- inventory/omarchy/configs.txt | head -1)
+        [[ -n $c ]] || die "no capture records Omarchy's copy of $rel"
+    fi
+    local st
+    st=$(j show "$c:inventory/omarchy/configs.txt" 2>/dev/null | awk -v r="$rel" 'substr($0, length($1 $2) + 3) == r { print $1 }')
+    case $st in
+        custom) j show "$c:inventory/omarchy/shipped/$rel" >"$out" ;;
+        same) j show "$c:files$HOME/.config/$rel" >"$out" ;;  # yours was Omarchy's
+        *) die "capture $(j rev-parse --short "$c") has no copy of Omarchy's $rel" ;;
+    esac
+    printf '%s\n' "$c"
+}
+
+om_merge_list() {
+    local st h rel c any=0 now
+    while read -r st h rel; do
+        [[ $st == custom && -f $OMARCHY_PATH/config/$rel && -f $HOME/.config/$rel ]] || continue
+        c=$(om_base "$rel" "$work/base" 2>/dev/null) || continue
+        now=$(sha256sum <"$OMARCHY_PATH/config/$rel" | cut -d' ' -f1)
+        [[ $(sha256sum <"$work/base" | cut -d' ' -f1) == "$now" ]] && continue
+        (( any )) || echo "Omarchy changed these since your copy was made:"
+        any=1
+        printf '  %s  (your copy from %s)\n' "$rel" "$(j log -1 --format='%h %cd' --date='format:%F %H:%M' "$c")"
+    done < <(om_at HEAD configs.txt)
+    (( any )) && echo "then: $prog merge FILE" || echo "no customized config needs a merge"
+}
+
+om_merge() {  # [-w] [FILE [BASE-REV]]
+    local write=0
+    [[ ${1:-} == -w ]] && { write=1; shift; }
+    (( $# <= 2 )) || die "usage: $prog merge [-w] [FILE [BASE-REV]]"
+    work=$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")
+    trap 'rm -rf "$work"' EXIT
+    if (( ! $# )); then
+        (( ! write )) || die "usage: $prog merge -w FILE [BASE-REV]"
+        om_merge_list; return 0
+    fi
+    local rel live ship c br=""
+    rel=$(om_rel "$1"); live=$HOME/.config/$rel; ship=$OMARCHY_PATH/config/$rel
+    [[ -f $ship ]] || die "Omarchy does not ship $rel"
+    [[ -f $live && ! -L $live ]] || die "~/.config/$rel is not a plain file here"
+    [[ -n ${2:-} ]] && br=$(rev "$2")
+    c=$(om_base "$rel" "$work/base" "$br")
+    local cs; cs=$(j log -1 --format='%h %cd' --date='format:%F %H:%M' "$c")
+    if cmp -s "$work/base" "$ship"; then
+        echo "Omarchy has not changed $rel since your copy (capture $cs)"; return 0
+    fi
+    local n=0
+    git merge-file -p -L yours -L "omarchy then ($cs)" -L "omarchy now ($(og omarchy-version))" \
+        "$live" "$work/base" "$ship" >"$work/merged" || n=$?
+    (( n >= 0 && n < 128 )) || die "git merge-file failed on $rel"
+    echo "Omarchy's change to $rel since your copy (capture $cs):"
+    diff -u --label "omarchy then" --label "omarchy now" "$work/base" "$ship" | sed 's/^/  /' || true
+    echo
+    if (( n )); then
+        echo "$n conflicts with your copy; merge by hand (nothing written):"
+        diff -u --label yours --label merged "$live" "$work/merged" | sed 's/^/  /' || true
+        (( ! write )) || exit 1
+        return 0
+    fi
+    if cmp -s "$live" "$work/merged"; then
+        echo "your copy already has Omarchy's change: nothing to merge"; return 0
+    fi
+    if (( ! write )); then
+        echo "merges cleanly; $prog merge -w $rel would change your copy:"
+        diff -u --label yours --label merged "$live" "$work/merged" | sed 's/^/  /' || true
+        return 0
+    fi
+    local saved=$state_dir/restored/$(date +%Y%m%d-%H%M%S)$live
+    mkdir -p "${saved%/*}"
+    cp -a "$live" "$saved"
+    cat "$work/merged" >"$live"
+    msg "merged Omarchy's change into $(tilde "$live")" "your copy before it is in $(tilde "$saved")"
+    trap - EXIT; rm -rf "$work"
+    capture -m "merge ~/.config/$rel with Omarchy $(og omarchy-version)" >/dev/null
+}
+
+# ------------------------------------------------- omawayback hooks
+# Omarchy runs ~/.config/omarchy/hooks/<name>.d/* after an update
+# (post-update), a theme change (theme-set) and a font change (font-set).
+# omawayback's hook in each records a named capture; installed with Omarchy's
+# own omarchy-hook-install, and marked so remove takes only its own.
+om_hook_types=(post-update theme-set font-set)
+om_hook_mark="# omawayback hook (omawayback hooks)"
+om_hook_file() { printf '%s\n' "$om_conf/hooks/$1.d/omawayback.hook"; }
+
+om_hook_text() {  # type
+    local pw
+    pw=$(command -v "$prog" 2>/dev/null || true)
+    [[ $pw == /* ]] || pw=$self_dir/$prog
+    printf '#!/bin/bash\n%s\npw=%q\n[[ -x $pw ]] || pw=%s\n' "$om_hook_mark" "$pw" "$prog"
+    if [[ $1 == post-update ]]; then
+        cat <<'HOOK'
+# a capture named after the version, like Omarchy's pre-update snapshot
+"$pw" -m "after omarchy-update to $(omarchy-version)"
+HOOK
+        return 0
+    fi
+    cat <<'HOOK'
+# a capture once switching stops: each change writes a token, and only the
+# one whose token is still there after the delay records, so clicking
+# through five themes makes one capture, named after what is current
+t=${XDG_RUNTIME_DIR:-/tmp}/omawayback-look
+if [[ ${1:-} == --later ]]; then
+    sleep "${OMAWAYBACK_LOOK_DELAY:-15}"
+    [[ $(cat "$t" 2>/dev/null) == "$2" ]] || exit 0
+    s=$HOME/.local/state/omarchy/current
+    exec "$pw" -m "look: $(cat "$s/theme.name" 2>/dev/null), $(omarchy-font-current 2>/dev/null)"
+fi
+mine="$$ $(date +%s%N)"
+echo "$mine" >"$t"
+# its own unit, so it outlives whatever ran the theme or font command
+env=()
+for v in PATH OMARCHY_PATH OMAWAYBACK_CONF OMAWAYBACK_STATE OMAWAYBACK_TREE OMAWAYBACK_LOOK_DELAY; do
+    [[ -n ${!v:-} ]] && env+=("--setenv=$v=${!v}")
+done
+systemd-run --user --quiet --collect "${env[@]}" -- bash "$0" --later "$mine" >/dev/null 2>&1 ||
+    setsid -f bash "$0" --later "$mine" </dev/null >/dev/null 2>&1
+exit 0
+HOOK
+}
+
+om_hooks() {  # [install|remove]
+    local ty f
+    case ${1:-} in
+        "")
+            for ty in "${om_hook_types[@]}"; do
+                f=$(om_hook_file "$ty")
+                if [[ ! -f $f ]]; then printf '%-12s not installed\n' "$ty"
+                elif ! grep -qxF -e "$om_hook_mark" "$f"; then
+                    printf '%-12s an omawayback.hook of your own (install replaces it)\n' "$ty"
+                elif [[ $(<"$f") == "$(om_hook_text "$ty")" ]]; then printf '%-12s installed\n' "$ty"
+                else printf '%-12s installed, from an older omawayback (install updates it)\n' "$ty"; fi
+            done ;;
+        install)
+            is_omarchy || die "this is not an Omarchy machine"
+            command -v omarchy-hook-install >/dev/null || die "omarchy-hook-install not found"
+            work=$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")
+            trap 'rm -rf "$work"' EXIT
+            for ty in "${om_hook_types[@]}"; do
+                om_hook_text "$ty" >"$work/omawayback.hook"
+                omarchy-hook-install "$ty" "$work/omawayback.hook" >/dev/null ||
+                    die "omarchy-hook-install $ty failed"
+            done
+            msg "hooks installed: a capture after each Omarchy update, theme change and font change" ;;
+        remove)
+            local gone=() kept=()
+            for ty in "${om_hook_types[@]}"; do
+                f=$(om_hook_file "$ty")
+                [[ -f $f ]] || continue
+                if grep -qxF -e "$om_hook_mark" "$f"; then rm -f "$f"; gone+=("$ty")
+                else kept+=("$ty"); fi
+            done
+            if (( ${#gone[@]} )); then msg "hooks removed: ${gone[*]}"; else msg "no omawayback hooks installed"; fi
+            if (( ${#kept[@]} )); then msg "left in place, not written by $prog: ${kept[*]}"; fi ;;
+        *) die "usage: $prog hooks [install|remove]" ;;
+    esac
+    return 0
+}
+
+# ------------------------------------------------- omawayback menu
+# Rows in the Omarchy menu. The menu reads one user file,
+# ~/.config/omarchy/extensions/omarchy-menu.jsonc; omawayback keeps its rows
+# in a marked block right after the opening brace. Its parser drops whole
+# comment lines and trailing commas, so the block is valid wherever the
+# file's own entries are. Every edit is checked as the menu reads it and
+# undone if it would not parse.
+om_menu_file=$om_conf/extensions/omarchy-menu.jsonc
+om_menu_begin="  // omawayback rows (omawayback menu): begin; install replaces, remove deletes"
+om_menu_end="  // omawayback rows: end"
+
+om_menu_rows() {
+    local pw t=omarchy-launch-floating-terminal-with-presentation
+    pw=$(command -v "$prog" 2>/dev/null || true)
+    [[ $pw == /* ]] || pw=$self_dir/$prog
+    pw=$(printf '%q' "$pw")
+    # id icon label description action
+    {
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            omawayback "󰋚" "Wayback" "Config history" "" \
+            omawayback.status "󰋼" "Status" "Last capture, recent captures" \
+                "$t '$pw status; echo; $pw log | head -20'" \
+            omawayback.capture "󰄀" "Capture Now" "Record a capture, with a name if you give one" \
+                "$t 'read -rp \"Name this capture (Enter for none): \" n; $pw -v \${n:+-m \"\$n\"}'" \
+            omawayback.machine "󰍹" "This Machine" "Omarchy setup beyond stock" \
+                "$t '$pw show'" \
+            omawayback.changes "󰦖" "Setup Changes" "Captures that changed packages, services, /etc or Omarchy" \
+                "$t '$pw changes'" \
+            omawayback.merge "󰘬" "Merge Omarchy Changes" "Configs Omarchy changed under your copy" \
+                "$t '$pw merge'"
+    } | while IFS=$'\t' read -r id icon label desc action; do
+        printf '  "%s": %s,\n' "$id" "$(jq -cn --arg icon "$icon" --arg label "$label" --arg d "$desc" --arg a "$action" \
+            '{icon: $icon, label: $label, description: $d} + (if $a == "" then {} else {action: $a} end)')"
+    done
+}
+
+# the file as the menu parses it: whole comment lines and trailing commas out
+om_menu_parses() {
+    grep -vE '^[[:space:]]*//' "$1" | sed -z 's/,\([[:space:]]*[]}]\)/\1/g' |
+        jq -e 'type == "object"' >/dev/null 2>&1
+}
+
+om_menu_strip() {  # file: without omawayback's block
+    awk -v b="$om_menu_begin" -v e="$om_menu_end" '
+        $0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$1"
+}
+
+om_menu() {  # [install|remove]
+    local f=$om_menu_file
+    case ${1:-} in
+        "")
+            if [[ ! -f $f ]] || ! grep -qxF -e "$om_menu_begin" "$f"; then echo "menu rows not installed"
+            elif [[ $(awk -v b="$om_menu_begin" -v e="$om_menu_end" '$0 == b { on = 1; next } $0 == e { on = 0 } on' "$f") == "$(om_menu_rows)" ]]; then
+                echo "menu rows installed (Wayback, on the Omarchy menu)"
+            else echo "menu rows installed, from an older omawayback (install updates them)"; fi ;;
+        install|remove)
+            is_omarchy || die "this is not an Omarchy machine"
+            work=$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")
+            trap 'rm -rf "$work"' EXIT
+            if [[ ! -f $f ]]; then
+                [[ $1 == install ]] || { msg "menu rows not installed"; return 0; }
+                mkdir -p "${f%/*}"
+                if [[ -f $OMARCHY_PATH/config/omarchy/extensions/omarchy-menu.jsonc ]]; then
+                    cp "$OMARCHY_PATH/config/omarchy/extensions/omarchy-menu.jsonc" "$f"
+                else printf '{\n}\n' >"$f"; fi
+            fi
+            om_menu_parses "$f" || die "$(tilde "$f") does not parse as the menu reads it; fix it first"
+            grep -vE '^[[:space:]]*//' "$f" | sed -z 's/,\([[:space:]]*[]}]\)/\1/g' |
+                jq -e '(.items | type) == "object"' >/dev/null 2>&1 &&
+                die "$(tilde "$f") keeps its rows under \"items\"; add omawayback's by hand"
+            om_menu_strip "$f" >"$work/menu"
+            if [[ $1 == install ]]; then
+                om_menu_rows >"$work/rows"
+                # after the first line that opens the object
+                awk -v rows="$work/rows" -v b="$om_menu_begin" -v e="$om_menu_end" '
+                    !done && /^[[:space:]]*\{[[:space:]]*$/ {
+                        print; print b; while ((getline l < rows) > 0) print l; print e; done = 1; next }
+                    { print }
+                    END { if (!done) exit 3 }' "$work/menu" >"$work/new" ||
+                    die "no line in $(tilde "$f") is just the opening {; add omawayback's rows by hand"
+            else
+                cp "$work/menu" "$work/new"
+            fi
+            om_menu_parses "$work/new" || die "the edited menu would not parse; $(tilde "$f") left as it was"
+            if cmp -s "$f" "$work/new"; then
+                [[ $1 == install ]] && msg "menu rows already installed" || msg "menu rows not installed"
+                return 0
+            fi
+            cat "$work/new" >"$f"
+            if [[ $1 == install ]]; then msg "menu rows installed: Wayback, on the Omarchy menu"
+            else msg "menu rows removed"; fi ;;
+        *) die "usage: $prog menu [install|remove]" ;;
+    esac
+    return 0
+}
+
+# changes: with no capture, the captures that changed the setup; with
+# FROM [TO], the setup changes between them (TO: the last capture)
+changes_cmd() {  # [FROM [TO]]
+    need_journal
+    local a b from to out pager
+    if (( $# == 0 )); then
+        pager=$(j var GIT_PAGER 2>/dev/null || echo cat)
+        if [[ -t 1 && $pager != cat ]]; then
+            om_log | LESS=${LESS:-FRX} sh -c "$pager" || true
+        else om_log; fi
+        return 0
+    fi
+    (( $# <= 2 )) || die "usage: $prog changes [FROM [TO]]"
+    a=$(rev "$1"); b=$(rev "${2:-HEAD}")
+    from="$(j rev-parse --short "$a") $(j log -1 --format=%cd --date='format:%F %H:%M' "$a")"
+    to="$(j rev-parse --short "$b") $(j log -1 --format=%cd --date='format:%F %H:%M' "$b")"
+    out=$(setup_summary "$a" "$b")
+    if [[ -z $out ]]; then echo "no setup changes from $from to $to"
+    else echo "setup changes from $from to $to:"; sed 's/^/  /' <<<"$out"; fi
+    # the reasons given along the way: labels and notes
+    jlog_noted --reverse "$a..$b" |
+        awk '/^\001/ { h = substr($0, 2); if (h ~ /: [^:]*$/ && h ~ / capture [^ ]+ [0-9-]+ [0-9]+:[0-9]+: /) {
+                             sub(/ capture [^ ]+ [0-9-]+ [0-9]+:[0-9]+: /, "  ", h); l[++n] = h }
+                         next }
+             NF { l[++n] = "  note: " $0 }
+             END { if (n) { print "named or noted on the way:"; for (i = 1; i <= n; i++) print "  " l[i] } }'
+    return 0
+}
+
+show_cmd() {  # [REV]
+    need_journal
+    (( $# <= 1 )) || die "usage: $prog show [REV]"
+    om_show "$(rev "${1:-HEAD}")"
+}
+
+# ---------------------------------------------------------------- notes
+# A reason attached to a capture after the fact, in git notes
+# (refs/notes/omawayback), so a capture keeps its hash. log and changes show
+# them; the journal's backup carries them.
+notes_ref=omawayback
+# git log ARGS as "\001HASH DATE SUBJECT" lines, each followed by its
+# notes; without notes yet, no %N (git warns about a missing notes ref)
+jlog_noted() {
+    if j rev-parse -q --verify "refs/notes/$notes_ref" >/dev/null; then
+        j log --notes="$notes_ref" --format='%x01%h %cd %s%n%N' --date='format:%F %H:%M' "$@"
+    else j log --format='%x01%h %cd %s' --date='format:%F %H:%M' "$@"; fi
+}
+
+note_cmd() {  # REV TEXT...
+    need_journal
+    (( $# >= 2 )) || die "usage: $prog note REV TEXT"
+    local r; r=$(rev "$1"); shift
+    j notes --ref="$notes_ref" append -m "$*" "$r"
+    msg "noted on $(j rev-parse --short "$r")"
+}
+
+# --------------------------------------------------- the install's /etc files
+# The copy omawayback-baseline kept of an /etc file, from the journal. Only
+# files no package owned or that differed from their package's copy were
+# kept whole; the others are a checksum, and say so.
+install_copy() {  # path
+    local p=$1 sum
+    [[ $p == /etc/* ]] || die "the record of the install holds /etc only"
+    j cat-file -e HEAD:factory/info.txt 2>/dev/null ||
+        die "no record of the install: sudo omawayback-baseline, once"
+    if j cat-file -e "HEAD:factory$p" 2>/dev/null; then
+        if [[ $(j ls-tree HEAD -- "factory$p" | cut -d' ' -f1) == 120000 ]]; then
+            printf -- '-> %s\n' "$(j show "HEAD:factory$p")"
+        else j show "HEAD:factory$p"; fi
+        return 0
+    fi
+    sum=$(j show HEAD:factory/etc.txt | awk -F'\t' -v p="$p" '$2 == p { print $1; exit }')
+    case $sum in
+        "") die "$p was not there at the install" ;;
+        -) die "$p was there at the install, but not readable by all, so not recorded" ;;
+        link:*) printf -- '-> %s\n' "${sum#link:}" ;;
+        *) die "$p was as its package shipped it at the install, so only its checksum was kept" \
+               "(pacman -Qkk tells whether it differs from its package now)" ;;
+    esac
+}
+
+install_cmd() {  # cat|diff PATH
+    need_journal
+    (( $# == 2 )) || die "usage: $prog $1 install PATH"
+    local p old now live rc=0
+    p=$(abs_path "$2")
+    old=$(install_copy "$p") || exit 1
+    if [[ $1 == cat ]]; then printf '%s\n' "$old"; return 0; fi
+    live=$etc_root${p#/etc}
+    if [[ -L $live ]]; then now="-> $(readlink "$live")"
+    elif [[ -r $live ]]; then now=$(<"$live")
+    elif j cat-file -e "HEAD:files$p" 2>/dev/null; then now=$(j show "HEAD:files$p")
+    elif [[ -e $live ]]; then die "$p is not readable, and not in the last capture"
+    else now=""; fi
+    diff -u --label "$p as installed" --label "$p now" <(printf '%s\n' "$old") \
+        <([[ -e $live || -L $live ]] && printf '%s\n' "$now") || rc=$?
+    (( rc <= 1 )) || exit "$rc"
+    (( rc == 1 )) || msg "$p is as it was at the install"
+    return 0
+}
+
+# ---------------------------------------------------------------- skill
+# The omawayback skill (skills/omawayback), linked into each agent's skills
+# directory the way Omarchy links its own: only for agents on this machine
+# (their own directory exists), never over an omawayback skill of your own.
+skill_src() { printf '%s\n' "$self_dir/skills/omawayback"; }
+skill_dirs() {
+    local d top
+    for d in "$HOME"/.agents/skills "$HOME"/.claude/skills "$HOME"/.codex/skills \
+             "$HOME"/.pi/agent/skills "$HOME"/.gemini/config/skills "$HOME"/.hermes/skills; do
+        top=${d#"$HOME"/}; top=$HOME/${top%%/*}
+        [[ -d $top ]] && printf '%s\n' "$d"
+    done
+    for d in "$HOME"/.hermes/profiles/*/; do [[ -d $d ]] && printf '%s\n' "${d%/}/skills"; done
+    return 0
+}
+
+skill_cmd() {  # [install|remove]
+    local src d l out=()
+    src=$(skill_src)
+    [[ -f $src/SKILL.md ]] || die "no skill at $(tilde "$src")"
+    case ${1:-} in
+        "")
+            while IFS= read -r d; do
+                l=$d/omawayback
+                if [[ -L $l && $(readlink -f "$l") == "$src" ]]; then echo "$(tilde "$d")  linked"
+                elif [[ -e $l || -L $l ]]; then echo "$(tilde "$d")  an omawayback skill of your own"
+                else echo "$(tilde "$d")  not linked"; fi
+            done < <(skill_dirs)
+            [[ -n $(skill_dirs) ]] || echo "no coding agents found" ;;
+        install)
+            while IFS= read -r d; do
+                l=$d/omawayback
+                if [[ -e $l && ! -L $l ]]; then err "left your own $(tilde "$l") in place"; continue; fi
+                mkdir -p "$d" && ln -sfn "$src" "$l" && out+=("$(tilde "$d")")
+            done < <(skill_dirs)
+            if (( ${#out[@]} )); then msg "skill linked in: ${out[0]}" "${out[@]:1}"
+            else msg "no coding agents found to link the skill for"; fi ;;
+        remove)
+            while IFS= read -r d; do
+                l=$d/omawayback
+                [[ -L $l && $(readlink -f "$l") == "$src" ]] && rm -f "$l" && out+=("$(tilde "$d")")
+            done < <(skill_dirs)
+            if (( ${#out[@]} )); then msg "skill removed from: ${out[0]}" "${out[@]:1}"
+            else msg "the skill was not linked anywhere"; fi ;;
+        *) die "usage: $prog skill [install|remove]" ;;
+    esac
+    return 0
+}
+
+# git checkouts inside the scope: copied as plain files (no .git), so record
+# where each came from and whether it had local changes
+nested_repos() {  # out
+    local r g
+    for r in "${live_roots[@]}"; do
+        [[ -d $r && ! -L $r ]] || continue
+        find "$r" -mindepth 1 -name .git -prune -print 2>/dev/null
+    done | sort -u | while read -r g; do
+        r=${g%/.git}
+        printf '%s origin=%s head=%s dirty=%s\n' "$(tilde "$r")" \
+            "$(git -C "$r" remote get-url origin 2>/dev/null || echo -)" \
+            "$(git -C "$r" rev-parse --short=12 HEAD 2>/dev/null || echo -)" \
+            "$(git -C "$r" status --porcelain 2>/dev/null | wc -l)"
+    done >"$1"
+}
+
+theme_gen() { cat "$HOME/.local/state/omarchy/current/theme.generation" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------- capture
+live_roots=() skip_paths=() absent=() large=() unreadable=()
+collect() {
+    live_roots=() skip_paths=() absent=() large=() unreadable=()
+    local r f
+    for r in "${roots[@]}"; do
+        r=${r%/}
+        if [[ -e $r || -L $r ]]; then live_roots+=("$r"); else absent+=("$r"); fi
+    done
+    # the selected Omarchy background, wherever its file lives
+    f=$HOME/.local/state/omarchy/current/background
+    if [[ -L $f ]] && f=$(readlink -f "$f") && [[ -f $f ]]; then live_roots+=("$f"); fi
+    if (( want_etc )); then
+        etc_auto=() etc_unreadable=()
+        discover_etc
+        live_roots+=("${etc_auto[@]}")
+        unreadable+=("${etc_unreadable[@]}")
+    fi
+
+    # Unreadable and oversized files inside the scope are skipped and listed,
+    # so rsync never fails on them and they never show up as deletions.
+    local dirs=()
+    for r in "${live_roots[@]}"; do [[ -d $r && ! -L $r ]] && dirs+=("$r"); done
+    if (( ${#dirs[@]} )); then
+        while IFS= read -r -d '' f; do skip_paths+=("$f"); unreadable+=("$f"); done < <(
+            find "${dirs[@]}" -name .git -prune -o ! -type l ! -readable -print0 -prune 2>/dev/null)
+        while IFS= read -r -d '' f; do skip_paths+=("$f"); large+=("$f"); done < <(
+            find "${dirs[@]}" -name .git -prune -o -type f -size +"${max_mb}"M -print0 2>/dev/null)
+    fi
+
+    build_filter "$work/filter"
+    mkdir -p "$tree/files"
+    local rc=0
+    # sockets and devices (ssh's ControlMaster sockets, gpg-agent's) are
+    # never copied (no -D); nonreg0 keeps rsync quiet about skipping them
+    rsync -rlpt --info=nonreg0 --chmod=Du+rwx,Fu+rw --delete --delete-excluded --filter="merge $work/filter" \
+        / "$tree/files/" 2>"$work/rsync.err" || rc=$?
+    # 24: a file vanished mid-copy, harmless; anything else fails the run
+    if (( rc != 0 && rc != 24 )); then
+        fail_reason="rsync exit $rc: $(grep -v '^rsync error' "$work/rsync.err" | head -3 | tr '\n' ' ')"
+        return 1
+    fi
+
+    # the record of the install (omawayback-baseline), copied in; it is
+    # written once, so it is committed once
+    if [[ -f $factory_dir/info.txt ]]; then
+        mkdir -p "$tree/factory"
+        rsync -rlpt --chmod=Du+rwx,Fu+rw --delete "$factory_dir/" "$tree/factory/" 2>>"$work/rsync.err" ||
+            { fail_reason="could not copy $(tilde "$factory_dir")"; return 1; }
+    else
+        rm -rf "$tree/factory"
+    fi
+
+    rm -rf "$tree/inventory" "$tree/metadata"
+    inventories "$tree/inventory"
+    # collect runs under `if`, where set -e is off: check what matters
+    [[ -s $tree/inventory/pacman.txt ]] || { fail_reason="pacman -Q gave nothing"; return 1; }
+    mkdir -p "$tree/metadata"
+    nested_repos "$tree/metadata/nested-repos.txt"
+    # mode and owner from the live files (git keeps only the exec bit):
+    # symbolic mode, octal mode, owner:group, path
+    (cd "$tree/files" && find . -mindepth 1 -printf '/%P\0') |
+        (xargs -0r stat -c '%A %a %U:%G %n' -- 2>/dev/null || true) |
+        sort -k4 >"$tree/metadata/files.txt"
+
+    # the scope, config and tool itself, so a restored journal explains itself
+    rm -rf "$tree/policy"; mkdir -p "$tree/policy"
+    cp "$conf_dir/scope" "$tree/policy/scope"
+    [[ -f $conf_dir/config ]] && cp "$conf_dir/config" "$tree/policy/config"
+    cp "$self" "$tree/policy/omawayback"
+    [[ -f $self_dir/README.md ]] && cp "$self_dir/README.md" "$tree/policy/README.md"
+
+    {
+        echo "# what this capture could not record"
+        for f in "${absent[@]}"; do echo "absent $(tilde "$f")"; done
+        for f in "${unreadable[@]}"; do echo "unreadable $(tilde "$f")"; done
+        for f in "${large[@]}"; do echo "too-large $(tilde "$f")"; done
+        # config dirs nothing in the scope covers: names only, to spot new apps
+        for f in "$HOME"/.config/*; do
+            [[ -e $f ]] || continue
+            local covered=0 r2
+            for r2 in "${live_roots[@]}" "${absent[@]}"; do
+                [[ $r2 == "$f" || $r2 == "$f"/* || $f == "$r2"/* ]] && { covered=1; break; }
+            done
+            (( covered )) || echo "unscoped $(tilde "$f")"
+        done
+    } | sort >"$tree/coverage.txt"
+}
+
+# commit message body: packages, theme, files
+summarize() {
+    if ! j rev-parse -q --verify HEAD >/dev/null; then
+        echo "first capture: $(wc -l <"$tree/inventory/pacman.txt") packages," \
+            "$(j diff --cached --name-only -- files | wc -l) files"
+        return 0
+    fi
+    sys_summary HEAD ""
+    if [[ -d $tree/inventory/omarchy ]]; then om_summary HEAD ""; fi
+    j diff --cached --no-renames --name-status -- files | awk '
+        { c[$1]++; if (NR <= 40) l = l "  " $1 " " substr($0, index($0, "files/") + 5) "\n" }
+        END { if (NR) printf "files: %d changed, %d added, %d deleted\n%s",
+                     c["M"]+0, c["A"]+0, c["D"]+0, l }'
+    # the other inventories (units, tools, the Omarchy profile) by name
+    j diff --cached --no-renames --name-only -- inventory |
+        grep -vE '^inventory/(pacman\.txt|omarchy/shipped/)' | sed 's|^inventory/||' |
+        paste -sd, | sed 's/,/, /g; s/^./inventories: &/'
+    return 0
+}
+
+capture() {
+    local dry=0 verbose=0 label="" o OPTIND=1
+    while getopts nvm:h o; do
+        case $o in
+            n) dry=1 ;; v) verbose=1 ;; m) label=$OPTARG ;;
+            h) usage; exit 0 ;; *) usage >&2; exit 2 ;;
+        esac
+    done
+    need_journal
+    read_scope
+
+    mkdir -p "$state_dir"
+    exec 9>"$state_dir/lock"
+    # a named capture (a hook, restore, merge) waits its turn; the timer's
+    # does not, the next hour catches up
+    if [[ -n $label ]]; then
+        flock -w 30 9 || { msg "another capture is running; \"$label\" not recorded"; exit 1; }
+    else
+        flock -n 9 || { msg "another capture is running"; exit 0; }
+    fi
+
+    # mid-upgrade state is not worth recording; a monitor watching the last
+    # success time will notice if this persists
+    if [[ -e /var/lib/pacman/db.lck ]]; then
+        msg "pacman is running, skipped"
+        (( dry )) || report skipped "pacman is running" 0 ""
+        exit 0
+    fi
+
+    local attempt gen ok=0
+    fail_reason=""
+    work=$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")
+    trap 'rm -rf "$work"' EXIT
+    for attempt in 1 2 3; do
+        gen=$(theme_gen)
+        if collect && [[ $(theme_gen) == "$gen" && ! -e /var/lib/pacman/db.lck ]]; then
+            ok=1; break
+        fi
+        [[ -n $fail_reason ]] && break
+        sleep 5
+    done
+    if (( ! ok )); then
+        local why=${fail_reason:-"theme or packages changed during capture"}
+        (( dry )) || report failed "$why" 0 ""
+        die "capture failed" "$why"
+    fi
+
+    local index=$gitdir/index
+    if (( dry )); then
+        index=$work/index; cp "$gitdir/index" "$index" 2>/dev/null || true
+    fi
+    GIT_INDEX_FILE=$index j add -A
+    local subject="capture $host $(date '+%F %H:%M')${label:+: $label}"
+    if GIT_INDEX_FILE=$index j diff --cached --quiet; then
+        if [[ -n $label ]] && (( ! dry )); then
+            # a named capture marks the moment even when nothing changed
+            j commit -q --allow-empty -m "$subject" -m "no changes"
+            report unchanged "$label: no changes" 0 "$(j rev-parse --short HEAD)"
+            msg "marked \"$label\" (no changes)"
+            return 0
+        fi
+        (( dry )) || report unchanged "no changes" 0 ""
+        msg "no changes"
+        return 0
+    fi
+
+    local body n
+    body=$(GIT_INDEX_FILE=$index summarize)
+    n=$(GIT_INDEX_FILE=$index j diff --cached --name-only | wc -l)
+    if (( dry )); then
+        if [[ -n $body ]]; then msg "would commit $n changed paths" "${body//$'\n'/$'\n'$pad}"
+        else msg "would commit $n changed paths"; fi
+        return 0
+    fi
+    j commit -q -m "$subject" -m "$body"
+    report committed "$n paths changed${label:+ ($label)}" "$n" "$(j rev-parse --short HEAD)"
+    if (( verbose )) && [[ -n $body ]]; then
+        msg "captured $n changed paths" "${body//$'\n'/$'\n'$pad}"
+    else
+        msg "captured $n changed paths"
+    fi
+}
+
+# ---------------------------------------------------------------- restore
+# Put a file or directory back as it was at REV. The current version is
+# copied aside first; files the old capture did not have are left alone
+# (the journal never held excluded files, so deleting would lose them);
+# the result is recorded as a named capture.
+# Files a later capture changed: putting those back goes back past a change
+# (a login token refreshed since, a config edited since). Not by name: by
+# the history. Prints "LIVE<tab>WHEN" for each one that differs from REV now.
+restore_newer() {  # rev live...
+    local r=$1 c when f live want have; shift
+    local -a tps=(); for live in "$@"; do tps+=("files$live"); done
+    local -A last=() atrev=()
+    while IFS= read -r -d '' f; do atrev[$f]=1; done < <(j ls-tree -r -z --name-only "$r" -- "${tps[@]}")
+    (( ${#atrev[@]} )) || return 0
+    while read -r c; do
+        when=$(j show -s --format=%cd --date=format:'%m-%d %H:%M' "$c")
+        while IFS= read -r -d '' f; do
+            [[ -n ${atrev[$f]:-} && -z ${last[$f]:-} ]] && last[$f]=$when
+        done < <(j diff-tree -z -r --no-commit-id --name-only "$c" -- "${tps[@]}")
+    done < <(j rev-list "$r..HEAD" -- "${tps[@]}")
+    for f in "${!last[@]}"; do
+        live=${f#files}
+        want=$(j rev-parse "$r:$f")
+        if [[ -L $live ]]; then have=$(printf '%s' "$(readlink "$live")" | git hash-object --stdin)
+        elif [[ -f $live ]]; then have=$(git hash-object -- "$live")
+        else have=""; fi
+        [[ $have == "$want" ]] || printf '%s\t%s\n' "$live" "${last[$f]}"
+    done | sort
+}
+
+restore() {
+    local dry=0 newer_as="" o OPTIND=1
+    while getopts nysh o; do
+        case $o in
+            n) dry=1 ;; y) newer_as=all ;; s) newer_as=skip ;;
+            h) usage; exit 0 ;; *) usage >&2; exit 2 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    (( $# >= 2 )) || die "usage: $prog restore [-n|-y|-s] REV PATH..."
+    need_journal
+    local r short p live
+    local -a lives=() kinds=()
+    r=$(rev "$1"); shift
+    short=$(j rev-parse --short "$r")
+    # every path checked before anything is written
+    for p in "$@"; do
+        live=$(abs_path "$p")
+        kinds+=("$(j cat-file -t "$r:files$live" 2>/dev/null)") ||
+            die "$(tilde "$live") is not in capture $short"
+        [[ $live == "$HOME"/* ]] ||
+            die "restore writes only inside your home" \
+                "for a system file: $prog cat $short $live | sudo tee $live >/dev/null"
+        lives+=("$live")
+    done
+
+    # going back past a later change is asked about, never assumed
+    local -a newer=() lines=(); local -A skip=(); local nl when
+    while IFS=$'\t' read -r nl when; do
+        newer+=("$nl"); lines+=("$(printf '  %-40s last changed %s' "$(tilde "$nl")" "$when")")
+    done < <(restore_newer "$r" "${lives[@]}")
+    if (( ${#newer[@]} )); then
+        local head="${#newer[@]} file(s) changed after $short ($(j show -s --format=%cd --date=format:'%m-%d %H:%M' "$r")):"
+        if (( dry )); then msg "$head" "${lines[@]}" "a restore asks about these first (-y: put them back too, -s: leave them)"
+        elif [[ -z $newer_as ]]; then
+            if [[ -t 0 ]]; then
+                msg "$head" "${lines[@]}"
+                local a=""; read -rp "${pad}put these back too? [y]es / [s]kip them / [N]o, nothing: " a || a=n
+                case $a in [yY]*) newer_as=all ;; [sS]*) newer_as=skip ;; *) msg "nothing restored"; return 0 ;; esac
+            else
+                die "$head" "${lines[@]}" "nothing restored: run again with -y to put them back too, or -s to leave them"
+            fi
+        fi
+        if [[ $newer_as == skip ]]; then for nl in "${newer[@]}"; do skip[$nl]=1; done; fi
+    fi
+
+    work=$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")
+    trap 'rm -rf "$work"' EXIT
+    local i stamp n_done=0; stamp=$(date +%Y%m%d-%H%M%S)
+    for i in "${!lives[@]}"; do
+        if [[ -n ${skip[${lives[$i]}]:-} ]]; then msg "left $(tilde "${lives[$i]}") as it is"; continue; fi
+        restore_one "$r" "$short" "${lives[$i]}" "${kinds[$i]}" "$work/old$i" "$stamp"
+        n_done=$((n_done + 1))
+    done
+    trap - EXIT; rm -rf "$work"
+    if (( ! dry && n_done )); then
+        local kept=""; (( ${#skip[@]} )) && kept=", ${#skip[@]} left as they are"
+        if (( ${#lives[@]} == 1 )); then
+            capture -m "restore $(tilde "${lives[0]}") from $short$kept" >/dev/null
+        else
+            capture -m "restore ${#lives[@]} paths from $short$kept" >/dev/null
+        fi
+    fi
+}
+
+restore_one() {  # rev short live kind src stamp, with restore's dry
+    local r=$1 short=$2 live=$3 kind=$4 src=$5 stamp=$6 tp=files$3
+    if [[ $kind == tree ]]; then
+        mkdir -p "$src"
+        j archive "$r:$tp" | tar -x -C "$src"
+        # what the answer said to leave: out of the copy, so it stays as it is
+        local k
+        for k in "${!skip[@]}"; do [[ $k == "$live"/* ]] && rm -f "$src${k#"$live"}"; done
+    else
+        local mode
+        mode=$(j ls-tree "$r:$(dirname "$tp")" -- "$(basename "$tp")" | cut -d' ' -f1)
+        if [[ $mode == 120000 ]]; then ln -s "$(j cat-file blob "$r:$tp")" "$src"
+        else
+            j cat-file blob "$r:$tp" >"$src"
+            if [[ $mode == 100755 ]]; then chmod 755 "$src"; fi
+        fi
+    fi
+    # modes as they were then (metadata: symbolic octal owner path)
+    j show "$r:metadata/files.txt" 2>/dev/null |
+        awk -v p="$live" '$4 == p || index($4, p "/") == 1 { print $2, substr($4, length(p) + 1) }' |
+        while read -r m rel; do
+            [[ -L $src$rel ]] || chmod "$m" "$src$rel" 2>/dev/null || true
+        done
+
+    if (( dry )); then
+        local d
+        d=$(diff -ru --no-dereference "$live" "$src" 2>/dev/null || true)
+        d=${d//"$src"/"$(tilde "$live") @ $short"}
+        if [[ -z $d ]]; then msg "$(tilde "$live") already matches $short"
+        else msg "restoring $(tilde "$live") from $short would change:"; printf '%s\n' "$d"; fi
+        return 0
+    fi
+
+    local saved="" extra=0
+    if [[ -e $live || -L $live ]]; then
+        saved=$state_dir/restored/$stamp$live
+        mkdir -p "${saved%/*}"
+        cp -a "$live" "$saved"
+    fi
+    if [[ $kind == tree ]]; then
+        mkdir -p "$live"
+        rsync -rlp "$src/" "$live/"
+        extra=$(comm -23 <(cd "$live" && find . -mindepth 1 | sort) \
+                         <(cd "$src" && find . -mindepth 1 | sort) | wc -l)
+    else
+        mkdir -p "${live%/*}"
+        [[ -d $live && ! -L $live ]] && die "$(tilde "$live") is now a directory; not replacing it"
+        rm -f "$live"
+        cp -a "$src" "$live"
+    fi
+    local lines=("restored $(tilde "$live") from $short")
+    [[ -n $saved ]] && lines+=("the version it replaced is in $(tilde "$saved")")
+    (( extra )) && lines+=("$extra paths there are newer than $short and were left in place")
+    msg "${lines[@]}"
+}
+
+init() {
+    [[ $(id -u) != 0 ]] || die "run as the user whose home this records, not root"
+    local tpl=${1:-}
+    if [[ ! -f $conf_dir/scope ]]; then
+        if [[ -z $tpl ]]; then
+            if command -v omarchy-version >/dev/null; then tpl=omarchy; else tpl=minimal; fi
+        fi
+        [[ -f $self_dir/templates/$tpl ]] || die "no template \"$tpl\" (have: $(templates))"
+        mkdir -p "$conf_dir"
+        cp "$self_dir/templates/$tpl" "$conf_dir/scope"
+        msg "scope from template $tpl: review $(tilde "$conf_dir/scope")"
+    elif [[ -n $tpl ]]; then
+        msg "keeping the existing scope; template $tpl not used"
+    fi
+    [[ -f $conf_dir/config ]] || printf 'host = %s\n' "$host" >"$conf_dir/config"
+    load_config
+    [[ $cfg_host == "$host" ]] || die "config says host = $cfg_host, this is $host"
+    if [[ -d $gitdir ]]; then
+        msg "journal already exists"
+    else
+        mkdir -p "$state_dir" "$tree"
+        chmod 700 "$state_dir"
+        # bare: the work tree is given on every call (j), never stored, so
+        # moving the directories needs no config change, and a plain git
+        # command against the journal refuses instead of using $PWD
+        git init -q --bare "$gitdir"
+        git --git-dir="$gitdir" config user.name "$prog"
+        git --git-dir="$gitdir" config user.email "$USER@$host"
+        git --git-dir="$gitdir" config core.autocrlf false
+        git --git-dir="$gitdir" config core.logAllRefUpdates true
+        msg "journal created; first capture follows"
+    fi
+    capture
+    if is_omarchy && [[ ! -f $(om_hook_file theme-set) ]]; then
+        msg "on Omarchy, \"$prog hooks install\" adds a capture after each" \
+            "update, theme change and font change, \"$prog skill install\" teaches" \
+            "coding agents to use the history, and \"$prog menu install\"" \
+            "puts Wayback on the Omarchy menu"
+    fi
+}
+
+status() {
+    need_journal
+    local f=$state_dir/status last_run result text
+    [[ -f $f ]] || { msg "no capture yet"; return 0; }
+    last_run=$(sed -n 's/^last_run=//p' "$f"); last_ok=$(sed -n 's/^last_ok=//p' "$f")
+    result=$(sed -n 's/^result=//p' "$f"); text=$(sed -n 's/^text=//p' "$f")
+    local lines=("last run $(date -d "@$last_run" '+%F %H:%M'): $result, $text")
+    if [[ $result == failed ]]; then
+        local good=never
+        [[ -n $last_ok ]] && good=$(date -d "@$last_ok" '+%F %H:%M')
+        lines+=("last good capture $good")
+    fi
+    lines+=("$(j rev-list --count HEAD 2>/dev/null || echo 0) captures, last commit $(j log -1 --format='%cd' --date='format:%F %H:%M' 2>/dev/null || echo none)")
+    msg "${lines[@]}"
+}
+
+git_cmd() {
+    need_journal
+    if [[ ${1:-} == push && $allow_push != yes ]]; then
+        die "refusing to push: the journal holds whatever the scope names," \
+            "keys and logins included. If the remote is private and you accept" \
+            "that, set allow_push = yes in $(tilde "$conf_dir/config")."
+    fi
+    j "$@"
+}
+
+case ${1:-} in
+    -h|--help|help) usage; exit 0 ;;
+    -V|--version) echo "$prog $version"; exit 0 ;;
+esac
+cmd=capture
+if (( $# )) && [[ $1 != -* ]]; then cmd=$1; shift; fi
+main_cmd() {  # command args...
+    local c=$1; shift
+    case $c in
+        restore) restore "$@" ;;
+        show) show_cmd "$@" ;;
+        changes) changes_cmd "$@" ;;
+        replay) need_journal; (( $# <= 1 )) || die "usage: $prog replay [REV]"
+                om_replay "$(rev "${1:-HEAD}")" ;;
+        merge) need_journal; om_merge "$@" ;;
+        hooks) need_journal; om_hooks "$@" ;;
+        menu) need_journal; om_menu "$@" ;;
+        note) note_cmd "$@" ;;
+        skill) skill_cmd "$@" ;;
+        git) git_cmd "$@" ;;
+        *) err "unknown command: $c"; usage >&2; exit 2 ;;
+    esac
+}
+
+case $cmd in
+    capture) capture "$@" ;;
+    init) init "$@" ;;
+    status) status ;;
+    log) need_journal
+         # notes under their capture
+         { if (( $# )); then jlog_noted -- "$(top "$1")"; else jlog_noted; fi; } |
+             awk '/^\001/ { print substr($0, 2); next } NF { print "  note: " $0 }' ;;
+    diff) need_journal
+          [[ ${1:-} == install ]] && { install_cmd diff "${2:-}"; exit 0; }
+          r=$(rev "${1:-HEAD}"); shift || true
+          if (( $# )); then j show --format='%h %s%n%n%b' "$r" -- "$(top "$1")"
+          else j show --format='%h %s%n%n%b' --stat "$r"; fi ;;
+    cat) need_journal
+         [[ ${1:-} == install ]] && { install_cmd cat "${2:-}"; exit 0; }
+         (( $# == 2 )) || die "usage: $prog cat REV PATH"
+         r=$(rev "$1"); j show "$r:$(tree_path "$2")" ;;
+    *) main_cmd "$cmd" "$@" ;;
+esac
