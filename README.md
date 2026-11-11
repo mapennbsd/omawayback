@@ -1,7 +1,7 @@
 # omawayback
 
 A hands-off history of your Omarchy workstation: what Omarchy changed,
-what you changed, and how to get back.
+what your agents changed, what you changed, and how to get back.
 
 Every hour omawayback records your machine three ways, in a private git
 history on the machine itself:
