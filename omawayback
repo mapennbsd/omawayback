@@ -16,7 +16,7 @@ umask 077
 export LC_ALL=C
 
 prog=omawayback
-version=0.14.0
+version=0.15.0
 self=$(readlink -f "${BASH_SOURCE[0]}")
 self_dir=${self%/*}
 
@@ -56,7 +56,7 @@ usage: $prog [capture] [-n] [-v] [-m LABEL]   record the live config (default)
        $prog changes                         captures that changed the setup, newest first
        $prog changes FROM [TO]               the setup changes between two captures
        $prog replay [REV]                    a script that rebuilds this setup on a fresh Omarchy
-       $prog merge [-w] [FILE [REV]]         merge Omarchy's change to a config you customize
+       $prog merge [-w [-y]] [FILE [REV]]    merge Omarchy's change to a config you customize
        $prog hooks [install|remove]          a capture after each update, theme and font change
        $prog menu [install|remove]           Wayback rows on the Omarchy menu
        $prog note REV TEXT                   say why a capture happened, after the fact
@@ -69,6 +69,8 @@ usage: $prog [capture] [-n] [-v] [-m LABEL]   record the live config (default)
 
 restore asks first about files a later capture changed (a login refreshed
 since, a config edited since); -y puts them back too, -s leaves them.
+Without a terminal (a coding agent, a script), restore and merge -w write
+nothing unless given -y (or -s): the user's yes, after they saw what changes.
 
 REV is a hash from log, anything git takes (HEAD~2), or @TIME for the last
 capture at or before a time: @yesterday, @'2026-11-09 14:00', @'3 hours ago'.
@@ -1491,7 +1493,7 @@ EOF
             echo "    $(om_home "${e%%	*}")"
         done
         echo ")"
-        echo 'run omawayback restore "$rev" "${paths[@]}"'
+        echo 'run omawayback restore -y "$rev" "${paths[@]}"'
         if (( ${#bases[@]} )); then
             echo "# Omarchy's version of each config you customize, as the capture had it;"
             echo "# where this Omarchy's differs, merge Omarchy's change in afterwards"
@@ -1743,10 +1745,12 @@ om_merge_list() {
     (( any )) && echo "then: $prog merge FILE" || echo "no customized config needs a merge"
 }
 
-om_merge() {  # [-w] [FILE [BASE-REV]]
-    local write=0
-    [[ ${1:-} == -w ]] && { write=1; shift; }
-    (( $# <= 2 )) || die "usage: $prog merge [-w] [FILE [BASE-REV]]"
+om_merge() {  # [-w [-y]] [FILE [BASE-REV]]
+    local write=0 yes=0
+    while [[ ${1:-} == -w || ${1:-} == -y || ${1:-} == -wy || ${1:-} == -yw ]]; do
+        case $1 in -w) write=1 ;; -y) yes=1 ;; *) write=1 yes=1 ;; esac; shift
+    done
+    (( $# <= 2 )) || die "usage: $prog merge [-w [-y]] [FILE [BASE-REV]]"
     work=$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")
     trap 'rm -rf "$work"' EXIT
     if (( ! $# )); then
@@ -1783,6 +1787,12 @@ om_merge() {  # [-w] [FILE [BASE-REV]]
         echo "merges cleanly; $prog merge -w $rel would change your copy:"
         diff -u --label yours --label merged "$live" "$work/merged" | sed 's/^/  /' || true
         return 0
+    fi
+    # as restore: without a terminal, the user's yes is -y
+    if (( ! yes )) && [[ ! -t 0 ]]; then
+        die "nothing written: without a terminal, merge -w needs the user's yes" \
+            "show them: $prog merge $rel" \
+            "ask, and only after they agree run: $prog merge -w -y $rel"
     fi
     local saved=$state_dir/restored/$(date +%Y%m%d-%H%M%S)$live
     mkdir -p "${saved%/*}"
@@ -2396,16 +2406,24 @@ restore() {
     if (( ${#newer[@]} )); then
         local head="${#newer[@]} file(s) changed after $short ($(j show -s --format=%cd --date=format:'%m-%d %H:%M' "$r")):"
         if (( dry )); then msg "$head" "${lines[@]}" "a restore asks about these first (-y: put them back too, -s: leave them)"
-        elif [[ -z $newer_as ]]; then
-            if [[ -t 0 ]]; then
-                msg "$head" "${lines[@]}"
-                local a=""; read -rp "${pad}put these back too? [y]es / [s]kip them / [N]o, nothing: " a || a=n
-                case $a in [yY]*) newer_as=all ;; [sS]*) newer_as=skip ;; *) msg "nothing restored"; return 0 ;; esac
-            else
-                die "$head" "${lines[@]}" "nothing restored: run again with -y to put them back too, or -s to leave them"
-            fi
+        elif [[ -z $newer_as && -t 0 ]]; then
+            msg "$head" "${lines[@]}"
+            local a=""; read -rp "${pad}put these back too? [y]es / [s]kip them / [N]o, nothing: " a || a=n
+            case $a in [yY]*) newer_as=all ;; [sS]*) newer_as=skip ;; *) msg "nothing restored"; return 0 ;; esac
         fi
         if [[ $newer_as == skip ]]; then for nl in "${newer[@]}"; do skip[$nl]=1; done; fi
+    fi
+    # Without a terminal (a coding agent, a script) nothing is written
+    # without -y or -s: the person's yes, given after they saw restore -n.
+    # Agents' own permission settings vary; this one is the tool's.
+    if (( ! dry )) && [[ -z $newer_as && ! -t 0 ]]; then
+        local -a why=()
+        (( ${#newer[@]} )) && why=("$head" "${lines[@]}")
+        why+=("nothing restored: without a terminal, restore needs the user's yes"
+              "show them: $prog restore -n $short $(printf '%q ' "$@")"
+              "ask, and only after they agree run it again with -y")
+        (( ${#newer[@]} )) && why+=("(or with -s, to leave the files changed since as they are)")
+        die "${why[@]}"
     fi
 
     work=$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")
