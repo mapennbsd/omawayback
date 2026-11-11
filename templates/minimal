@@ -1,0 +1,24 @@
+# omawayback scope: a small starting point for any pacman-based system.
+#
+#   PATH       capture this file or directory; ~ is your home
+#   - PATTERN  never capture (rsync pattern; a leading ~ or / anchors it)
+#   @etc       every /etc file pacman says you modified, plus every /etc
+#              file no package owns
+#
+# Everything a path here holds is recorded, keys and logins included:
+# nothing is left out by name. The journal stays on this machine, readable
+# by you alone (omawayback git push is refused), so it can bring them back.
+# To keep something out, add a "- PATTERN" line.
+
+@etc
+
+~/.bashrc
+~/.bash_profile
+~/.profile
+~/.ssh
+~/.gnupg
+- ~/.gnupg/random_seed
+~/.local/bin
+~/.config/git
+~/.config/systemd/user
+~/.config/omawayback
