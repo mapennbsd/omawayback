@@ -26,6 +26,12 @@ guessing.
 
 ## Rules
 
+- **Ask before you change anything, every time.** Show the user the exact
+  command and what it will do (`restore -n`, `merge` without `-w`), and
+  wait for their yes. Only then run it, with `-y`: `omawayback restore -y
+  REV PATH`, `omawayback merge -w -y FILE`. `-y` means "the user agreed";
+  never add it to get past a refusal. Run without a terminal, as you are,
+  restore and merge -w refuse without it and write nothing.
 - Read-only commands, freely: `status`, `show`, `changes`, `log`, `diff`,
   `cat`, `cat install`, `diff install`, `restore -n`, `merge` without `-w`.
 - Anything that changes the machine needs the user's yes first, every
@@ -73,13 +79,13 @@ guessing.
    - a config file in the home directory:
      `omawayback restore -n REV PATH` shows it, and lists any file there a
      later capture changed (a login refreshed since, a config edited
-     since). Show the user that list and ask: `restore -y REV PATH` puts
-     those back too, `restore -s REV PATH` leaves them (the right answer
-     for logins and tokens unless the user says otherwise). Without `-y`
-     or `-s` it stops and changes nothing. It keeps the replaced copy and
-     records a capture;
-   - a config Omarchy changed under the user's copy: `omawayback merge FILE`,
-     then `omawayback merge -w FILE`;
+     since). Show the user the diff and that list, and ask: once they
+     agree, `restore -y REV PATH` puts it all back, `restore -s REV PATH`
+     leaves the files changed since (the right answer for logins and
+     tokens unless the user says otherwise). Without `-y` or `-s` it
+     changes nothing. It keeps the replaced copy and records a capture;
+   - a config Omarchy changed under the user's copy: `omawayback merge FILE`
+     shows the merge; once the user agrees, `omawayback merge -w -y FILE`;
    - an `/etc` file: restore does not write outside home; give the user
      `omawayback cat REV /etc/X | sudo tee /etc/X`;
    - a package upgrade: the old version is usually in
@@ -104,7 +110,7 @@ guessing.
 | `omawayback cat REV PATH` | a file as it was |
 | `omawayback cat install /etc/X`, `diff install /etc/X` | an `/etc` file as installed, or against it |
 | `omawayback restore [-n\|-y\|-s] REV PATH...` | put files back (home only; `-n` shows; files changed later: `-y` too, `-s` leave) |
-| `omawayback merge [-w] [FILE]` | merge Omarchy's change into the user's copy |
+| `omawayback merge [-w -y] [FILE]` | merge Omarchy's change into the user's copy (`-w -y` writes, after the user agrees) |
 | `omawayback note REV TEXT` | add the reason to a capture |
 | `omawayback git ARGS` | any git command on the journal, e.g. `git log -p -- inventory/pacman.txt` |
 
