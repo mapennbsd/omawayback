@@ -1,0 +1,11 @@
+# omawayback: hourly capture; Persistent catches up after a missed hour.
+[Unit]
+Description=Hourly omawayback capture
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
