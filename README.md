@@ -284,9 +284,13 @@ anything, restore lists each file it would replace that a capture after REV
 changed, with when, and asks: put them back too, skip them (restore only
 the rest), or stop. This is how an old login token or a config edited
 since does not come back by accident; it goes by the history, not by file
-names. `-y` answers yes and `-s` skip; without a terminal (an agent, a
-script) it lists them and stops unless given one. Restoring the latest
-capture, or onto a fresh install, finds nothing to ask about.
+names. `-y` answers yes and `-s` skip. Restoring the latest capture, or
+onto a fresh install, finds nothing to ask about.
+
+Without a terminal (a coding agent, a script), `restore` and `merge -w`
+write nothing unless given `-y` (or `-s`): that flag is your yes, given
+after you saw `restore -n` or `merge`. The replay script passes it for you,
+since running it is the yes.
 
 restore checks every path before writing anything, saves the version it
 replaces under `~/.local/state/omawayback/restored/`, restores file modes as
@@ -311,7 +315,11 @@ narrow down with `log`, `diff` and `show`, match against the logs, then
 propose the smallest fix that can be undone. `status`, `show`, `changes`,
 `log`, `diff`, `cat`, `restore -n` and `merge` without `-w` never change
 anything; the skill has the agent ask before `restore`, `merge -w`,
-`note` or anything with sudo. An agent reading the journal sends what it
+`note` or anything with sudo, and the tool backs it up: run without a
+terminal, as agents run commands, `restore` and `merge -w` write nothing
+unless given `-y`, the user's yes. An agent that skips asking gets a
+refusal telling it to show you the command and ask. That holds whatever
+the agent's own permission settings are. An agent reading the journal sends what it
 reads to its model's provider. The journal holds your configuration and
 whatever keys and logins your scope records; the skill tells agents never
 to print one.
