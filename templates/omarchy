@@ -1,0 +1,93 @@
+# omawayback scope for an Omarchy desktop. Review it: add the apps you use,
+# drop the ones you don't (missing paths are fine, and listed as absent).
+#
+#   PATH       capture this file or directory; ~ is your home
+#   - PATTERN  never capture (rsync pattern; a leading ~ or / anchors it)
+#   @etc       every /etc file pacman says you modified, plus every /etc
+#              file no package owns
+#
+# Everything a path here holds is recorded, keys and logins included:
+# nothing is left out by name. The journal stays on this machine, readable
+# by you alone (omawayback git push is refused), so it can bring them back.
+# To keep something out, add a "- PATTERN" line.
+
+@etc
+
+# shell, ssh and gpg: keys, known hosts and keyrings too
+~/.bashrc
+~/.bash_profile
+~/.bash_logout
+~/.profile
+~/.XCompose
+~/.ssh
+~/.gnupg
+- ~/.gnupg/random_seed
+~/.local/share/keyrings
+~/bin
+~/.local/bin
+~/.local/share/applications
+# web app icons, which a launcher alone does not bring back
+~/.local/share/icons/hicolor/256x256/apps
+
+# Omarchy and Hyprland: config, hooks, extensions, custom themes, plugins
+~/.config/hypr
+~/.config/omarchy
+# the active theme, background and toggles live in state, not config
+~/.local/state/omarchy/current
+~/.local/state/omarchy/settings
+~/.local/state/omarchy/toggles
+~/.local/state/omarchy/defaults
+~/.local/state/omarchy/theme-backgrounds
+~/.local/state/omarchy/migrations
+~/.local/state/omarchy/done
+
+# terminals, editors, desktop
+~/.config/alacritty
+~/.config/kitty
+~/.config/ghostty
+~/.config/foot
+~/.config/nvim
+~/.config/tmux
+~/.config/btop/btop.conf
+~/.config/lazygit
+~/.config/starship.toml
+~/.config/fontconfig
+~/.config/gtk-3.0
+~/.config/gtk-4.0
+~/.config/mimeapps.list
+~/.config/user-dirs.dirs
+~/.config/xdg-terminals.list
+~/.config/mpv
+
+# user services and session
+~/.config/systemd/user
+~/.config/autostart
+~/.config/environment.d
+
+# development tools
+~/.config/git
+~/.config/mise
+~/.config/gh
+
+# coding agents: settings, hooks, skills, rules and logins; not sessions
+~/.claude/settings.json
+~/.claude/.credentials.json
+~/.claude/CLAUDE.md
+~/.claude/hooks
+~/.claude/skills
+~/.claude/agents
+~/.claude/commands
+~/.codex/config.toml
+~/.codex/auth.json
+~/.codex/hooks.json
+~/.codex/rules
+~/.codex/skills
+~/.gemini/settings.json
+~/.gemini/oauth_creds.json
+~/.gemini/GEMINI.md
+~/.config/opencode
+- ~/.config/opencode/node_modules/
+~/.agents/skills
+
+# omawayback's own config
+~/.config/omawayback
