@@ -80,7 +80,8 @@ want to look, from a terminal or from **Wayback** on the Omarchy menu:
     omawayback changes                        captures that changed the setup, newest first
     omawayback changes @'last week'           what changed in the setup since then
     omawayback merge                          configs Omarchy changed under your copy
-    omawayback log                            every capture, newest first
+    omawayback log                            every capture, newest first, in a pager
+    omawayback log -n 10                      only the last ten
     omawayback log ~/.config/hypr/bindings.lua    only captures that touched it
     omawayback diff                           what the last capture changed, file by file
     omawayback cat @yesterday ~/.bashrc       a file as it was then
