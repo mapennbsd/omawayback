@@ -47,7 +47,7 @@ usage() {
 usage: $prog [capture] [-n] [-v] [-m LABEL]   record the live config (default)
        $prog init [TEMPLATE]                 create the journal (templates: $(templates))
        $prog status                          last capture and any error
-       $prog log [PATH]                      captures, newest first
+       $prog log [-n N] [PATH]               captures, newest first (-n: the last N)
        $prog diff [REV] [PATH]               what changed in a capture (default: last)
        $prog cat REV PATH                    a file as it was at REV
        $prog cat|diff install PATH           an /etc file as installed, or against it
@@ -1986,14 +1986,8 @@ om_menu() {  # [install|remove]
 # FROM [TO], the setup changes between them (TO: the last capture)
 changes_cmd() {  # [FROM [TO]]
     need_journal
-    local a b from to out pager
-    if (( $# == 0 )); then
-        pager=$(j var GIT_PAGER 2>/dev/null || echo cat)
-        if [[ -t 1 && $pager != cat ]]; then
-            om_log | LESS=${LESS:-FRX} sh -c "$pager" || true
-        else om_log; fi
-        return 0
-    fi
+    local a b from to out
+    if (( $# == 0 )); then page om_log; return 0; fi
     (( $# <= 2 )) || die "usage: $prog changes [FROM [TO]]"
     a=$(rev "$1"); b=$(rev "${2:-HEAD}")
     from="$(j rev-parse --short "$a") $(j log -1 --format=%cd --date='format:%F %H:%M' "$a")"
@@ -2028,6 +2022,34 @@ jlog_noted() {
     if j rev-parse -q --verify "refs/notes/$notes_ref" >/dev/null; then
         j log --notes="$notes_ref" --format='%x01%h %cd %s%n%N' --date='format:%F %H:%M' "$@"
     else j log --format='%x01%h %cd %s' --date='format:%F %H:%M' "$@"; fi
+}
+
+# Run a command, through git's pager (less -FRX: a short list just prints)
+# when stdout is a terminal, plain otherwise: pipes and agents get no pager.
+page() {  # command...
+    local pager
+    pager=$(j var GIT_PAGER 2>/dev/null || echo cat)
+    if [[ -t 1 && $pager != cat ]]; then
+        # quitting the pager early is not an error
+        "$@" | LESS=${LESS:-FRX} sh -c "$pager" || true
+    else "$@"; fi
+}
+
+# log's lines: each capture, with its notes under it
+log_lines() {  # git log args...
+    jlog_noted "$@" | awk '/^\001/ { print substr($0, 2); next } NF { print "  note: " $0 }'
+}
+
+log_cmd() {  # [-n N] [PATH]
+    need_journal
+    local max=()
+    if [[ ${1:-} == -n ]]; then
+        [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die "usage: $prog log [-n N] [PATH]"
+        max=(--max-count="$2"); shift 2
+    fi
+    (( $# <= 1 )) || die "usage: $prog log [-n N] [PATH]"
+    if (( $# )); then page log_lines "${max[@]}" -- "$(top "$1")"
+    else page log_lines "${max[@]}"; fi
 }
 
 note_cmd() {  # REV TEXT...
@@ -2596,10 +2618,7 @@ case $cmd in
     capture) capture "$@" ;;
     init) init "$@" ;;
     status) status ;;
-    log) need_journal
-         # notes under their capture
-         { if (( $# )); then jlog_noted -- "$(top "$1")"; else jlog_noted; fi; } |
-             awk '/^\001/ { print substr($0, 2); next } NF { print "  note: " $0 }' ;;
+    log) log_cmd "$@" ;;
     diff) need_journal
           [[ ${1:-} == install ]] && { install_cmd diff "${2:-}"; exit 0; }
           r=$(rev "${1:-HEAD}"); shift || true
