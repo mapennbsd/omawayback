@@ -74,6 +74,16 @@ check "cat at a time" test "$(J cat @now "$cfg/a.conf")" = two
 check "time before first capture refused" grep -q 'no capture' <<<"$(J cat @2001-01-01 "$cfg/a.conf")"
 check "log by path" test "$(J log "$cfg/a.conf" | wc -l)" = 2
 check "log by relative path" test "$(cd "$cfg" && "$pw" log a.conf | wc -l)" = 2
+check "log -n: only the last N" test "$(J log -n 1 | wc -l)" = 1
+check "log -n: newest first" test "$(J log -n 1 | cut -d' ' -f1)" = "$("$pw" git rev-parse --short HEAD)"
+check "log -n with a path" test "$(J log -n 1 "$cfg/a.conf" | wc -l)" = 1
+check "log -n: bad count refused" grep -q 'usage:' <<<"$(J log -n 0)"
+check "log -n: missing count refused" grep -q 'usage:' <<<"$(J log -n)"
+check "log: piped output not paged" bash -c '! grep -q "^PAGED" <<<"$0"' "$(GIT_PAGER='sed s/^/PAGED/' J log)"
+if command -v script >/dev/null; then
+    out=$(GIT_PAGER='sed s/^/PAGED/' script -qec "$pw log -n 1" /dev/null </dev/null 2>&1)
+    check "log: paged on a terminal" grep -q '^PAGED' <<<"$out"
+fi
 check "diff names the file" grep -q 'a.conf' <<<"$(J diff HEAD)"
 
 chmod 755 "$cfg/a.conf"; J >/dev/null
