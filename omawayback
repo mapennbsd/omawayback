@@ -16,7 +16,7 @@ umask 077
 export LC_ALL=C
 
 prog=omawayback
-version=0.15.0
+version=0.16.0
 self=$(readlink -f "${BASH_SOURCE[0]}")
 self_dir=${self%/*}
 
