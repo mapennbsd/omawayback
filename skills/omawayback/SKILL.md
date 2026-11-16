@@ -105,7 +105,7 @@ guessing.
 | `omawayback status` | last run, last good capture |
 | `omawayback show [REV]` | the machine against stock Omarchy and its install, with whose each change is |
 | `omawayback changes [FROM [TO]]` | captures that changed the setup; or every change between two captures |
-| `omawayback log [PATH]` | every capture (or those touching PATH), with names and notes |
+| `omawayback log [-n N] [PATH]` | every capture (or those touching PATH), newest first, with names and notes; `-n N` the last N |
 | `omawayback diff [REV] [PATH]` | what a capture changed |
 | `omawayback cat REV PATH` | a file as it was |
 | `omawayback cat install /etc/X`, `diff install /etc/X` | an `/etc` file as installed, or against it |
